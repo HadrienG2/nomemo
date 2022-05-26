@@ -13,8 +13,10 @@ pub struct ParseCache {
     config: CacheConfig,
 }
 //
+// TODO: Add a configuration mechanism
 struct CacheConfig {
     /// Inner parser that we're trying to avoid calling via memoization
+    // TODO: Generalize to any nom parser
     parser: Box<dyn Fn(Input) -> Option<(Input, Output)>>,
 
     /// Truth that a parse was complex enough to warrant memoization
@@ -38,7 +40,7 @@ struct CacheConfig {
 
     /// Size of a PrefixToOutput list that initiates prefix deduplication
     ///
-    /// Should be chosen such that low_water_mark_ratio * high_water_mark > 2,
+    /// Should be chosen such that low_water_mark_ratio * high_water_mark >= 2,
     /// otherwise we'll try to deduplicate subtrees with only one element which
     /// is stupid.
     ///
@@ -56,6 +58,7 @@ struct CacheConfig {
 impl ParseCache {
     /// Find cached output associated with a string, or compute output and
     /// insert it into the cache.
+    // TODO: Just implement the nom Parse trait
     pub fn get_or_insert<'input>(
         &mut self,
         input: Input<'input>,
@@ -115,8 +118,7 @@ impl ParseCache {
             let output = Rc::new(output);
             tree.push((new_suffix, PrefixMapping::Output(output.clone())));
 
-            // If this causes the current subtree to reach the high water mark,
-            // deduplcate the current subtree.
+            // Deduplcate the current subtree if high water mark is reached
             if tree.len() > config.high_water_mark {
                 Self::deduplicate(tree, config, 1.0);
             }
