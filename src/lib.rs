@@ -5,16 +5,16 @@ type Input<'a> = &'a str;
 type Output = ();
 
 /// Cache of strings we've parsed before and associated parser output
-pub struct ParseCache {
+pub struct CachingParser {
     /// Cached (string -> output) mappings
     data: PrefixToOutput,
 
     /// Cache configuration
-    config: CacheConfig,
+    config: CachingParserConfig,
 }
 //
-// TODO: Add a configuration mechanism
-struct CacheConfig {
+// TODO: Add a construction/configuration mechanism
+struct CachingParserConfig {
     /// Inner parser that we're trying to avoid calling via memoization
     // TODO: Generalize to any nom parser
     parser: Box<dyn Fn(Input) -> Option<(Input, Output)>>,
@@ -55,7 +55,7 @@ struct CacheConfig {
     low_water_mark_ratio: f32,
 }
 //
-impl ParseCache {
+impl CachingParser {
     /// Find cached output associated with a string, or compute output and
     /// insert it into the cache.
     // TODO: Just implement the nom Parse trait
@@ -69,7 +69,7 @@ impl ParseCache {
     /// Recursive implementation of get_or_insert targeting a cache subtree
     fn get_or_insert_impl<'input>(
         tree: &mut PrefixToOutput,
-        config: &mut CacheConfig,
+        config: &mut CachingParserConfig,
         initial_input: Input<'input>,
         remaining_input: &'input [u8],
     ) -> Option<(Input<'input>, Rc<Output>)> {
@@ -139,7 +139,11 @@ impl ParseCache {
     /// are below the low water mark or it is provably impossible for them to go
     /// below said mark (in which case the water mark is adjusted with a warning)
     ///
-    fn deduplicate(tree: &mut PrefixToOutput, config: &mut CacheConfig, water_mark_ratio: f32) {
+    fn deduplicate(
+        tree: &mut PrefixToOutput,
+        config: &mut CachingParserConfig,
+        water_mark_ratio: f32,
+    ) {
         // Extract the old subtree and put a new one in its place
         let mut old_tree = std::mem::take(tree);
 
@@ -233,7 +237,7 @@ impl ParseCache {
 }
 
 /// Mapping from a chunk of parser input (prefix string) to associated output or
-/// possible next strings (suffixes) eventually leading to parser output.
+/// possibly next strings (suffixes) eventually leading to parser output.
 type PrefixToOutput = Vec<(Vec<u8>, PrefixMapping)>;
 //
 /// Things which a prefix string can map into
