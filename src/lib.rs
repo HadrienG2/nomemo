@@ -50,20 +50,18 @@ struct CachingParserConfig {
     worth_caching: Box<dyn Fn(Input, &Output) -> bool>,
 
     /// Size of a PrefixToOutput list that initiates prefix deduplication
-    ///
-    /// Should be chosen such that low_water_mark_ratio * high_water_mark >= 2,
-    /// otherwise we'll try to deduplicate subtrees with only one element which
-    /// is stupid.
-    ///
     high_water_mark: usize,
 
     /// Targeted max PrefixToOutput list length after prefix deduplication,
-    /// as a fraction of high_water_mark.
-    ///
-    /// Should be in the ] 0.0, 1.0 ] range, anything too close to zero is most
-    /// likely a mistake per the above constraint on high_water_mark.
-    ///
+    /// as a fraction of high_water_mark, guides deduplication recursion.
     low_water_mark_ratio: f32,
+}
+//
+impl CachingParserConfig {
+    /// Targeted max PrefixToOutput list length after prefix deduplication
+    fn low_water_mark(&self) -> usize {
+        (self.low_water_mark_ratio * (self.high_water_mark as f32)) as usize
+    }
 }
 //
 impl CachingParser {
@@ -142,7 +140,7 @@ impl CachingParserBuilder {
             parser: Box::new(parser),
             check_result: Box::new(check_result),
             worth_caching: None,
-            high_water_mark: 256,
+            high_water_mark: 512,
             low_water_mark_ratio: 0.5,
         }
     }
@@ -151,14 +149,14 @@ impl CachingParserBuilder {
     ///
     /// Some parsers are only expensive to call in specific circumstances. In
     /// that case, it is useless to memoize "fast" calls (as cache recalls will
-    /// be slower than direct parsing) and doing so can even harm the memory
+    /// be slower than direct parsing) and doing so can actually harm the memory
     /// footprint and recall performance of the cache. So here you can provide a
     /// criterion to tell which cache outputs should be memoized and which ones
-    /// shouldn't be memoized.
+    /// should not be memoized, weeding out excessively simple parses.
     ///
-    /// The provided function receives the subset of input that was parsed, the
-    /// output that was produced, and decides on those grounds whether a certain
-    /// parser result should be memoized (true) or not (false).
+    /// The provided function receives the subset of input that was consumed by
+    /// the parser, the output that was produced, and decides on those grounds
+    /// whether a certain parse should be memoized (true) or not (false).
     ///
     pub fn retention_criterion(
         mut self,
@@ -170,16 +168,20 @@ impl CachingParserBuilder {
 
     /// Tune the "high water mark" parser cache deduplication parameter
     ///
-    /// The parser cache is structured as a prefix -> suffix -> ... -> output
-    /// tree. Deduplicating common prefixes is not done every time a new cache
-    /// entry is inserted because...
+    /// The parser cache is structured as a prefix -> suffix -> suffix -> ...
+    /// -> output tree. Deduplicating common prefixes is not done every time a
+    /// new cache entry is inserted because...
     ///
-    /// 1. Deduplicating common prefixes is a relatively expensive operation
-    /// 2. Searching a linear list is quite fast as long as the list is not too
-    ///    long, whereas navigating a prefix -> suffix node is a bit expensive,
-    ///    making deduplication only worthwhile on long lists.
+    /// 1. Deduplicating common prefixes is a relatively expensive operation,
+    ///    with some setup costs that can be amortized.
+    /// 2. Deduplication produces best results with a good knowledge of what's
+    ///    being deduplicated, i.e. a relatively long list of inputs.
+    /// 3. Searching a linear list is quite fast as long as the list is not too
+    ///    long, whereas navigating a prefix -> suffix tree edge is a bit
+    ///    expensive due to CPU cache mechanics. So deduplication only leads to
+    ///    a net performance benefit when performed on longer lists.
     ///
-    /// The high water mark tuning parameter dictates how big a prefix/suffix
+    /// The high water mark tuning parameter dictates how big a prefix or suffix
     /// list needs to get before it gets deduplicated. Low values will lead to
     /// a smaller search space, but a more deeply nested cache structure and
     /// higher deduplication overhead. Higher values will lead to faster search
@@ -189,9 +191,9 @@ impl CachingParserBuilder {
     ///
     /// When tuning this, bear in mind that the product of this parameter by the
     /// low water mark fraction should be at least the number of unique bytes
-    /// appearing your input grammar (if unsure, try 128 for ASCII input and 256
-    /// for unicode or raw byte input). Otherwise, the cache may need to
-    /// override your setting to a more sensible value (with a warning log).
+    /// appearing your input grammar (if unsure, do not get below 128 for ASCII
+    /// input and 256 for other "raw byte" input). Otherwise, the cache may need
+    /// to override your setting to a more sensible value (with a warning).
     ///
     pub fn high_water_mark(mut self, mark: usize) -> Self {
         assert!(mark >= 2, "No point in deduplicating a list of <2 elements");
@@ -203,7 +205,7 @@ impl CachingParserBuilder {
     ///
     /// As discussed in the high_water_mark setting description, there is a
     /// tradeoff between maximal deduplication / minimal search space and
-    /// avoidance of some run-time overheads.
+    /// avoidance of various kinds of run-time overheads.
     ///
     /// Since deduplication has some fixed setup overheads and can lead to bad
     /// degenerate cases (e.g. all but one suffix with one shared prefix), it
@@ -228,30 +230,33 @@ impl CachingParserBuilder {
         self
     }
 
-    /// Finish the parser cache buildign process
+    /// Finish the parser cache building process
     pub fn build(self) -> CachingParser {
+        // Configure the CachingParser
+        let worth_caching = self.worth_caching.unwrap_or_else(|| Box::new(|_, _| true));
+        let config = CachingParserConfig {
+            parser: self.parser,
+            check_result: self.check_result,
+            worth_caching,
+            high_water_mark: self.high_water_mark,
+            low_water_mark_ratio: self.low_water_mark_ratio,
+        };
+
         // Validate low water mark configuration
-        let low_water_mark = (self.low_water_mark_ratio * self.high_water_mark as f32) as usize;
         assert!(
-            low_water_mark >= 2,
+            config.low_water_mark() >= 2,
             "low_water_mark_ratio is set too low ({}) with respect to \
             high_water_mark ({}) and that leads to an excessively small low \
-            water mark ({low_water_mark})",
-            self.low_water_mark_ratio,
-            self.high_water_mark
+            water mark ({})",
+            config.low_water_mark_ratio,
+            config.high_water_mark,
+            config.low_water_mark(),
         );
 
         // Build the CachingParser
-        let worth_caching = self.worth_caching.unwrap_or_else(|| Box::new(|_, _| true));
         CachingParser {
             data: PrefixToOutput::with_capacity(self.high_water_mark),
-            config: CachingParserConfig {
-                parser: self.parser,
-                check_result: self.check_result,
-                worth_caching,
-                high_water_mark: self.high_water_mark,
-                low_water_mark_ratio: self.low_water_mark_ratio,
-            },
+            config,
         }
     }
 }
@@ -337,7 +342,6 @@ fn deduplicate(tree: &mut PrefixToOutput, config: &mut CachingParserConfig, wate
         .next()
         .expect("tree should contain >= 1 element");
     let mut matches = Vec::new();
-    let low_water_mark = (config.high_water_mark as f32 * config.low_water_mark_ratio) as usize;
     loop {
         // Extract all entries that have 1 byte in common with the reference
         let ref_byte = reference.0[0];
@@ -361,7 +365,7 @@ fn deduplicate(tree: &mut PrefixToOutput, config: &mut CachingParserConfig, wate
                 .collect::<Vec<_>>();
 
             // If that subtree is too big, deduplicate it as well
-            if suffixes.len() > low_water_mark {
+            if suffixes.len() > config.low_water_mark() {
                 deduplicate(&mut suffixes, config, config.low_water_mark_ratio);
             }
 
