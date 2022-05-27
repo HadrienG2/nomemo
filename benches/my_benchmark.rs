@@ -27,17 +27,16 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             BatchSize::LargeInput,
         )
     });
-    let setup = || builder().build();
     c.bench_function("insert/pass/cache", |b| {
         b.iter_batched_ref(
-            setup,
+            || builder().build(),
             |parser| parser.get_or_insert(black_box("A thing")),
             BatchSize::LargeInput,
         )
     });
     c.bench_function("insert/fail", |b| {
         b.iter_batched_ref(
-            setup,
+            || builder().build(),
             |parser| parser.get_or_insert(black_box("A")),
             BatchSize::LargeInput,
         )
@@ -48,13 +47,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     // retrieval failure scenarios: either the cached prefix doesn't match, or
     // it matches but the resulting estimated parse doesn't pass the check.
     let setup = || {
-        let mut parser = builder().build();
+        let mut parser = builder()
+            .retention_criterion(|input, _| input == "A")
+            .build();
         parser.get_or_insert("A thing");
         parser
     };
     c.bench_function("retrieve/pass", |b| {
         b.iter_batched_ref(
-            setup.clone(),
+            setup,
             |parser| parser.get_or_insert(black_box("A similar thing")),
             BatchSize::LargeInput,
         )
