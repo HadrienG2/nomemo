@@ -20,6 +20,7 @@ pub struct CachingParser {
 type PrefixToOutput = Vec<(Vec<u8>, PrefixMapping)>;
 //
 /// Things which a prefix string can map into
+#[derive(Clone, Debug, PartialEq)]
 enum PrefixMapping {
     /// Direct mapping to output data
     Output(Rc<Output>),
@@ -244,7 +245,7 @@ impl CachingParserBuilder {
 
         // Validate low water mark configuration
         assert!(
-            config.low_water_mark() >= 2,
+            config.low_water_mark() > 2,
             "low_water_mark_ratio is set too low ({}) with respect to \
             high_water_mark ({}) and that leads to an excessively small low \
             water mark ({})",
@@ -309,7 +310,7 @@ fn get_or_insert_impl<'input>(
         tree.push((new_suffix, PrefixMapping::Output(output.clone())));
 
         // Deduplcate the current subtree if high water mark is reached
-        if tree.len() > config.high_water_mark {
+        if tree.len() >= config.high_water_mark {
             deduplicate(tree, config, 1.0);
         }
         output
@@ -365,7 +366,7 @@ fn deduplicate(tree: &mut PrefixToOutput, config: &mut CachingParserConfig, wate
                 .collect::<Vec<_>>();
 
             // If that subtree is too big, deduplicate it as well
-            if suffixes.len() > config.low_water_mark() {
+            if suffixes.len() >= config.low_water_mark() {
                 deduplicate(&mut suffixes, config, config.low_water_mark_ratio);
             }
 
@@ -389,7 +390,7 @@ fn deduplicate(tree: &mut PrefixToOutput, config: &mut CachingParserConfig, wate
     // If not, the water mark is unsatisfiable, so increase it with a
     // warning to 2x above the max observed irreductible subtree length.
     //
-    if tree.len() > (config.high_water_mark as f32 * water_mark_ratio) as usize {
+    if tree.len() >= (config.high_water_mark as f32 * water_mark_ratio) as usize {
         config.high_water_mark = (2.0 * tree.len() as f32 / water_mark_ratio) as usize;
         log::warn!(
             "High water mark is unsatisfiable, increasing it to {}",
@@ -420,4 +421,318 @@ fn lcp<'a>(reference: &'a [u8], matches: impl Iterator<Item = &'a [u8]> + Clone)
     reference
 }
 
-// TODO: Tests and benchmarks
+// TODO: Add benchmarks
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        cell::Cell,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn new() {
+        // Basic mocks to test that input functions are used as expected
+        static PARSER_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn parser_mock(_: Input) -> Option<(Input, Output)> {
+            PARSER_CALLS.fetch_add(1, Ordering::Relaxed);
+            Some(("", Output::default()))
+        }
+        static CHECKER_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn checker_mock(_: Input, _: &Output) -> bool {
+            CHECKER_CALLS.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        static RETAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn retain_mock(_: Input, _: &Output) -> bool {
+            RETAIN_CALLS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+
+        // Checks that should be valid no matter how the parser is configured
+        let common_checks = |parser: &CachingParser, expected_retain| {
+            assert_eq!(parser.data.len(), 0);
+            assert_eq!(parser.data.capacity(), parser.config.high_water_mark);
+
+            let old_parser_calls = PARSER_CALLS.load(Ordering::Relaxed);
+            let next_parser_calls = old_parser_calls + 1;
+            let old_checker_calls = CHECKER_CALLS.load(Ordering::Relaxed);
+            let next_checker_calls = old_checker_calls + 1;
+
+            (parser.config.parser)("");
+            assert_eq!(PARSER_CALLS.load(Ordering::Relaxed), next_parser_calls);
+            assert_eq!(CHECKER_CALLS.load(Ordering::Relaxed), old_checker_calls);
+
+            (parser.config.check_result)("", &Output::default());
+            assert_eq!(PARSER_CALLS.load(Ordering::Relaxed), next_parser_calls);
+            assert_eq!(CHECKER_CALLS.load(Ordering::Relaxed), next_checker_calls);
+
+            assert_eq!(
+                (parser.config.worth_caching)("", &Output::default()),
+                expected_retain
+            );
+            assert_eq!(PARSER_CALLS.load(Ordering::Relaxed), next_parser_calls);
+            assert_eq!(CHECKER_CALLS.load(Ordering::Relaxed), next_checker_calls);
+        };
+
+        // Basic configuration
+        let parser = CachingParser::new(parser_mock, checker_mock);
+        common_checks(&parser, true);
+        assert!(parser.config.high_water_mark >= 256);
+        assert!(parser.config.low_water_mark() >= 256);
+
+        // Custom configuration
+        let parser = CachingParser::builder(parser_mock, checker_mock)
+            .retention_criterion(retain_mock)
+            .high_water_mark(128)
+            .low_water_mark_ratio(0.75)
+            .build();
+        let old_retain_calls = RETAIN_CALLS.load(Ordering::Relaxed);
+        common_checks(&parser, false);
+        assert_eq!(RETAIN_CALLS.load(Ordering::Relaxed), old_retain_calls + 1);
+        assert_eq!(parser.config.high_water_mark, 128);
+        assert_eq!(parser.config.low_water_mark_ratio, 0.75);
+        assert_eq!(parser.config.low_water_mark(), 96);
+    }
+
+    // Basic test parser that looks for a space and strips the beginning of the
+    // string until that space if it finds it, associated check, and a way to
+    // monitor how many times the parser and check were called
+    fn strip_space_parser_builder() -> (CachingParserBuilder, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let parse_count = Rc::new(Cell::new(0));
+        let check_count = Rc::new(Cell::new(0));
+        let parse_count2 = parse_count.clone();
+        let check_count2 = check_count.clone();
+        let builder = CachingParser::builder(
+            move |input| {
+                parse_count2.set(parse_count2.get() + 1);
+                input
+                    .find(' ')
+                    .map(|pos| (&input[pos..], Output::default()))
+            },
+            move |rest, output| {
+                check_count2.set(check_count2.get() + 1);
+                assert_eq!(output, &Output::default());
+                match rest.chars().next() {
+                    Some(' ') => true,
+                    _ => false,
+                }
+            },
+        );
+        (builder, parse_count, check_count)
+    }
+    //
+    fn strip_space_parser() -> (CachingParser, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let (builder, parse_count, check_count) = strip_space_parser_builder();
+        (builder.build(), parse_count, check_count)
+    }
+
+    #[test]
+    fn insert_success() {
+        let (mut parser, parse_count, check_count) = strip_space_parser();
+        let output = Rc::new(Output::default());
+        assert_eq!(
+            parser.get_or_insert("And then"),
+            Some((" then", output.clone()))
+        );
+        assert_eq!(
+            parser.data,
+            vec![(
+                "And".as_bytes().into(),
+                PrefixMapping::Output(output.clone())
+            )]
+        );
+        assert_eq!(parse_count.get(), 1);
+        assert_eq!(check_count.get(), 0);
+    }
+
+    #[test]
+    fn insert_failure() {
+        let (mut parser, parse_count, check_count) = strip_space_parser();
+        assert_eq!(parser.get_or_insert(""), None);
+        assert_eq!(parser.data, PrefixToOutput::default());
+        assert_eq!(parse_count.get(), 1);
+        assert_eq!(check_count.get(), 0);
+    }
+
+    #[test]
+    fn retrieve_success() {
+        let (mut parser, parse_count, check_count) = strip_space_parser();
+        parser.get_or_insert("And then");
+        let output = Rc::new(Output::default());
+        assert_eq!(
+            parser.get_or_insert("And if"),
+            Some((" if", output.clone()))
+        );
+        assert_eq!(
+            parser.data,
+            vec![(
+                "And".as_bytes().into(),
+                PrefixMapping::Output(output.clone())
+            )]
+        );
+        assert_eq!(parse_count.get(), 1);
+        assert_eq!(check_count.get(), 1);
+    }
+
+    #[test]
+    fn retrieve_failure() {
+        let (mut parser, parse_count, check_count) = strip_space_parser();
+        parser.get_or_insert("Add to that");
+        assert_eq!(parser.get_or_insert("Additionally"), None);
+        assert_eq!(
+            parser.data,
+            vec![(
+                "Add".as_bytes().into(),
+                PrefixMapping::Output(Rc::new(Output::default()))
+            )]
+        );
+        assert_eq!(parse_count.get(), 2);
+        assert_eq!(check_count.get(), 1);
+    }
+
+    #[test]
+    fn retention_failure() {
+        let (parser_builder, parse_count, check_count) = strip_space_parser_builder();
+        let mut parser = parser_builder
+            .retention_criterion(|input, _output| input.len() > 128)
+            .build();
+        let output = Rc::new(Output::default());
+        assert_eq!(
+            parser.get_or_insert("Something in the way she moves"),
+            Some((" in the way she moves", output.clone()))
+        );
+        assert_eq!(parser.data, PrefixToOutput::default());
+        assert_eq!(parse_count.get(), 1);
+        assert_eq!(check_count.get(), 0);
+    }
+
+    #[test]
+    fn basic_deduplication() {
+        // Set up the parser with a high and low watermark of 4 items
+        let (parser_builder, parse_count, check_count) = strip_space_parser_builder();
+        let mut parser = parser_builder
+            .high_water_mark(4)
+            .low_water_mark_ratio(1.0)
+            .build();
+
+        // Until the high water mark is reached, nothing happens
+        parser.get_or_insert("GameObject is a Unity class");
+        parser.get_or_insert("GameOn was a French journal");
+        parser.get_or_insert("GameBoy is a video game console");
+        let output = Rc::new(Output::default());
+        let outmap = PrefixMapping::Output(output.clone());
+        assert_eq!(
+            parser.data,
+            vec![
+                ("GameObject".as_bytes().into(), outmap.clone()),
+                ("GameOn".as_bytes().into(), outmap.clone()),
+                ("GameBoy".as_bytes().into(), outmap.clone()),
+            ]
+        );
+
+        // Once the high water mark is reached, deduplication occurs
+        // Because we use the maximal low water mark, it is not recursive here
+        parser.get_or_insert("Not everything is about games");
+        assert_eq!(
+            parser.data,
+            vec![
+                (
+                    "Game".as_bytes().into(),
+                    PrefixMapping::Suffixes(vec![
+                        ("Boy".as_bytes().into(), outmap.clone()),
+                        // Notice the remaining "O" duplication here
+                        ("Object".as_bytes().into(), outmap.clone()),
+                        ("On".as_bytes().into(), outmap.clone()),
+                    ])
+                ),
+                ("Not".as_bytes().into(), outmap.clone()),
+            ]
+        );
+
+        // No need for the parser to adjust the HWM here
+        assert_eq!(parser.config.high_water_mark, 4);
+
+        // This should not result in new parser calls
+        assert_eq!(parse_count.get(), 4);
+        assert_eq!(check_count.get(), 0);
+
+        // The cache still works as before with the deduplicated layout
+        assert_eq!(
+            parser.get_or_insert("GameObject used to be an adventurer like you"),
+            Some((" used to be an adventurer like you", output.clone()))
+        );
+        assert_eq!(parse_count.get(), 4);
+        assert_eq!(check_count.get(), 1);
+        assert_eq!(
+            parser.get_or_insert("GameObjection could exist in Phoenix Wright"),
+            Some((" could exist in Phoenix Wright", output.clone()))
+        );
+        assert_eq!(parse_count.get(), 5);
+        assert_eq!(check_count.get(), 2);
+    }
+
+    #[test]
+    fn recursive_deduplication() {
+        // Set up the parser with a high water mark of 4 items and a low water
+        // mark of 2 items (= maximal deduplication)
+        let (parser_builder, parse_count, check_count) = strip_space_parser_builder();
+        let mut parser = parser_builder
+            .high_water_mark(5)
+            .low_water_mark_ratio(0.601)
+            .build();
+        assert_eq!(parser.config.low_water_mark(), 3);
+
+        // Until we reached 4 items, nothing happens, it's the high water mark
+        // that dictates when deduplication occurs.
+        parser.get_or_insert("GameObject is a Unity class");
+        parser.get_or_insert("GameOn was a French journal");
+        parser.get_or_insert("GameBoy is a video game console");
+        parser.get_or_insert("Not everything is about games");
+        let output = Rc::new(Output::default());
+        let outmap = PrefixMapping::Output(output.clone());
+        assert_eq!(
+            parser.data,
+            vec![
+                ("GameObject".as_bytes().into(), outmap.clone()),
+                ("GameOn".as_bytes().into(), outmap.clone()),
+                ("GameBoy".as_bytes().into(), outmap.clone()),
+                ("Not".as_bytes().into(), outmap.clone()),
+            ]
+        );
+
+        // Above the high water mark, the deduplication algorithm gets more
+        // aggressive, tying to get down to the individual matches
+        parser.get_or_insert("GameBowl is not a thing (yet?)");
+        assert_eq!(
+            parser.data,
+            vec![
+                (
+                    "Game".as_bytes().into(),
+                    PrefixMapping::Suffixes(vec![
+                        (
+                            "Bo".as_bytes().into(),
+                            PrefixMapping::Suffixes(vec![
+                                ("wl".as_bytes().into(), outmap.clone()),
+                                ("y".as_bytes().into(), outmap.clone()),
+                            ])
+                        ),
+                        (
+                            "O".as_bytes().into(),
+                            PrefixMapping::Suffixes(vec![
+                                ("bject".as_bytes().into(), outmap.clone()),
+                                ("n".as_bytes().into(), outmap.clone()),
+                            ])
+                        ),
+                    ])
+                ),
+                ("Not".as_bytes().into(), outmap.clone()),
+            ]
+        );
+        assert_eq!(parse_count.get(), 5);
+        assert_eq!(check_count.get(), 0);
+
+        // No need for the parser to adjust the HWM here either
+        assert_eq!(parser.config.high_water_mark, 5);
+    }
+}
