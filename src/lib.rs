@@ -345,9 +345,10 @@ fn deduplicate(tree: &mut PrefixToOutput, config: &mut CachingParserConfig, wate
     let mut matches = Vec::new();
     loop {
         // Extract all entries that have 1 byte in common with the reference
-        let ref_byte = reference.0[0];
-        while let Some(matching) = old_tree_iter.next_if(|(k, _v)| k[0] == ref_byte) {
-            matches.push(matching);
+        if let Some(&ref_byte) = reference.0.get(0) {
+            while let Some(matching) = old_tree_iter.next_if(|(k, _v)| k[0] == ref_byte) {
+                matches.push(matching);
+            }
         }
 
         // If that search yielded at least one result...
