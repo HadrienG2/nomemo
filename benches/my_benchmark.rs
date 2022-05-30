@@ -80,30 +80,35 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     // A bit of base64 infrastructure will come in handy for the next benches
     const DIGIT: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let div_round_up = |num, den| num / den + (num % den != 0) as u32;
-    let num_digits = |x: usize| div_round_up(x.trailing_zeros(), 64usize.trailing_zeros());
-    let write_digits = |buf: &mut String, x: usize, num_digits: u32| {
+    let num_digits = |x: usize, base: usize| {
+        assert!(base >= 2);
+        div_round_up(x.trailing_zeros(), base.trailing_zeros())
+    };
+    let write_digits = |buf: &mut String, x: usize, num_digits: u32, base: usize| {
+        assert!(base >= 2 && base <= 64);
         let mut acc = x;
         for _ in 0..num_digits {
-            let digit = acc % 64;
+            let digit = acc % base;
             buf.push(DIGIT[digit] as char);
-            acc /= 64;
+            acc /= base;
         }
     };
 
     // Unsuccessful search in an undeduplicated list of varying length where all
     // entries can be eliminated by looking up one single character. This gives
     // an idea of how quickly we iterate through a list of prefixes/suffixes
-    // when the overhead of actually checking an entry is negligible.
+    // when the overhead of actually checking an entry is negligible (otherwise
+    // we're just measuring the cost of strcmp, which is not super interesting)
     {
-        let setup = |num_inputs: usize| {
+        let setup = |num_items: usize| {
             let mut parser = builder()
-                .high_water_mark(10 * num_inputs)
+                .high_water_mark(10 * num_items)
                 .low_water_mark_ratio(1.0)
                 .build();
-            let num_digits = num_digits(num_inputs);
+            let num_digits = num_digits(num_items, 64);
             let mut buf = String::with_capacity(num_digits as usize + 1);
-            for input in 0..num_inputs {
-                write_digits(&mut buf, input, num_digits);
+            for input in 0..num_items {
+                write_digits(&mut buf, input, num_digits, 64);
                 buf.push(' ');
                 parser.get_or_insert(&buf);
                 buf.clear();
@@ -155,7 +160,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             parser
         };
         let mut group = c.benchmark_group("search/nested");
-        for tree_depth in [4, 8, 16, 32, 64, 128, 256, 512, 4096] {
+        for tree_depth in [4, 8, 16, 32, 64, 128, 256, 512] {
             group.throughput(Throughput::Elements(tree_depth as _));
             let input = std::iter::repeat('A').take(tree_depth).collect::<String>();
             group.bench_with_input(
@@ -172,39 +177,114 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         }
     }
 
-    // TODO: Then do benchmark groups + throughput numbers of these scenarios :
+    // Successful search in a best-case perfectly balanced deduplicated tree:
     //
-    // TODO: Unsuccessful search in a best-case deduplicated tree of fixed
-    //       number of elements (say, 4096 to fit in two base64 digits) but
-    //       varying arity (each layer of the tree divides the search space by
-    //       N. Dataset is made of pairs of base64 digits again, but chosen to
-    //       achieve the desired deduplication pattern.
+    //       "0" -> "0" -> "0" -> ...
+    //                  -> "1" -> ...
+    //                  -> "2" -> ...
+    //                  -> "3" -> ...
+    //           -> "1" -> ...
+    //           -> "2" -> ...
+    //           -> "3" -> ...
+    //       "1" -> ...
+    //       "2" -> ...
+    //       "3" -> ...
     //
-    //       "00" -> "00" -> "00" -> ...
-    //                    -> "01" -> ...
-    //                    -> "02" -> ...
-    //                    -> "03" -> ...
-    //            -> "01" -> ...
-    //            -> "02" -> ...
-    //            -> "03" -> ...
-    //       "01" -> ...
-    //       "02" -> ...
-    //       "03" -> ...
-    //
-    //       This gives an idea of how much a tree can save time with respect to
-    //       a list when more or less optimal balancing is achieved. Try both
-    //       the scenario where the search ends after navigating the prefix list
-    //       and that where it needs to get to the bottom of the tree. Measure
-    //       throughput wrt the number of elements in the tree (search space
-    //       size) so that numbers are comparable to the above benchmarks.
-    //
-    // TODO: Then find a good microbenchmark for the deduplication process
-    //       itself, with varying degrees of recursion, probably using a variant
-    //       of the last dataset above.
-    //
-    // TODO: Then put it all together with a mixed insertion/retrieval
-    //       benchmark, that shows influence of the water mark tuning parameters
-    //       at various hit/miss ratios.
+    // In this benchmark, we search for the last element of a perfectly balanced
+    // tree of varying arity (from binary, to 64-ary). Comparing this to
+    // search/linear/4096 gives an idea of why we bother with deduplication, and
+    // the perf dependance on tree arity is also interesting for those wondering
+    // about the tree depth vs list length tradeoff.
+    {
+        const NUM_ITEMS: usize = 4096;
+        let setup = |arity: usize| {
+            let mut parser = builder()
+                .high_water_mark(NUM_ITEMS)
+                .low_water_mark_ratio(3 as f32 / NUM_ITEMS as f32 + f32::EPSILON)
+                .build();
+            let num_digits = num_digits(NUM_ITEMS, arity);
+            let mut buf = String::with_capacity(num_digits as usize + 1);
+            for input in 0..NUM_ITEMS {
+                write_digits(&mut buf, input, num_digits, arity);
+                buf.push(' ');
+                parser.get_or_insert(&buf);
+                buf.clear();
+            }
+            parser
+        };
+        let mut group = c.benchmark_group("search/tree");
+        // For those analyzing benchmark results, 4096 is...
+        // - 12 digits in base 2
+        // - 6 digits in base 4
+        // - 4 digits in base 8
+        // - 3 digits in base 16
+        // - 2 digits in base 64
+        for arity in [2, 4, 8, 16, 64] {
+            group.throughput(Throughput::Elements(NUM_ITEMS as _));
+            let num_digits = num_digits(NUM_ITEMS, arity);
+            let mut input = String::with_capacity(num_digits as usize);
+            write_digits(&mut input, NUM_ITEMS - 1, num_digits, arity);
+            group.bench_with_input(BenchmarkId::from_parameter(arity as u64), &arity, |b, _| {
+                b.iter_batched_ref(
+                    || setup(arity),
+                    |parser| parser.get_or_insert(black_box(&input)),
+                    BatchSize::LargeInput,
+                )
+            });
+        }
+    }
+
+    // Finally, we measure the performance of the deduplication algorithm in
+    // various configurations.
+    {
+        let setup = |num_prefixes: usize, num_suffixes: usize| {
+            assert!(num_prefixes <= 64 && num_suffixes <= 64);
+            let num_items = num_prefixes * num_suffixes;
+            let mut parser = builder()
+                .high_water_mark(num_items)
+                .low_water_mark_ratio(1.0)
+                .build();
+            let mut buf = String::with_capacity(3);
+            for prefix in 0..num_prefixes {
+                write_digits(&mut buf, prefix, 1, 64);
+                for suffix in 0..num_suffixes {
+                    // Do not insert the last element during setup...
+                    if (prefix == num_prefixes - 1) && (suffix == num_suffixes - 1) {
+                        break;
+                    }
+                    write_digits(&mut buf, suffix, 1, 64);
+                    buf.push(' ');
+                    parser.get_or_insert(&buf);
+                    buf.pop();
+                    buf.pop();
+                }
+                buf.clear();
+            }
+            parser
+        };
+        let mut group = c.benchmark_group("deduplicate");
+        for num_prefixes in [2, 4, 8, 16, 32, 64] {
+            for num_suffixes in [2, 4, 8, 16, 32, 64] {
+                let num_items = num_prefixes * num_suffixes;
+                group.throughput(Throughput::Elements(num_items as _));
+                // ...for the last element will be inserted here
+                let mut input = String::with_capacity(3);
+                write_digits(&mut input, num_prefixes - 1, 1, 64);
+                write_digits(&mut input, num_suffixes - 1, 1, 64);
+                input.push(' ');
+                group.bench_function(
+                    format!("{num_prefixes}prefixes/{num_suffixes}suffixes"),
+                    |b| {
+                        b.iter_batched_ref(
+                            || setup(num_prefixes, num_suffixes),
+                            |parser| parser.get_or_insert(black_box(&input)),
+                            BatchSize::LargeInput,
+                        )
+                    },
+                );
+            }
+        }
+    }
 }
 
 criterion_group!(benches, criterion_benchmark);
