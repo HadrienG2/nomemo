@@ -1,17 +1,48 @@
 // TODO: General crate docs + deny(missing_docs)
 
+use nom::AsBytes;
 use std::rc::Rc;
 
-// TODO: Generalize
-type Input<'a> = &'a str;
+/// We accept as input types which can be infaillibly converted into a sequence
+/// of bytes and faillibly converted from some sequences of bytes.
+pub trait ByteBased: AsBytes {
+    /// Try constructing the type from bytes
+    fn try_from(bytes: &[u8]) -> Option<&Self>;
+
+    /// Length of the byte representation of this type
+    fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    /// Slice the first N bytes of the input, and return the result if valid
+    fn get_prefix(&self, len: usize) -> Option<&Self> {
+        self.as_bytes().get(..len).map(Self::try_from).flatten()
+    }
+}
+//
+impl ByteBased for [u8] {
+    fn try_from(bytes: &[u8]) -> Option<&[u8]> {
+        Some(bytes)
+    }
+}
+//
+impl ByteBased for str {
+    fn try_from(bytes: &[u8]) -> Option<&str> {
+        std::str::from_utf8(bytes).ok()
+    }
+
+    fn get_prefix(&self, len: usize) -> Option<&Self> {
+        self.get(..len)
+    }
+}
 
 /// Cache of strings we've parsed before and associated parser output
-pub struct CachingParser<Output> {
+pub struct CachingParser<Input: ByteBased + ?Sized, Output> {
     /// Cached (string -> output) mappings
     data: PrefixToOutput<Output>,
 
     /// Cache configuration
-    config: CachingParserConfig<Output>,
+    config: CachingParserConfig<Input, Output>,
 }
 //
 /// Mapping from a chunk of parser input (prefix string) to associated output or
@@ -28,26 +59,26 @@ enum PrefixMapping<Output> {
     Suffixes(PrefixToOutput<Output>),
 }
 //
-struct CachingParserConfig<Output> {
+struct CachingParserConfig<Input: ByteBased + ?Sized, Output> {
     /// Inner parser that we're trying to avoid calling via memoization
     ///
     /// See constructor docs for semantics.
     ///
     // TODO: Generalize to any nom parser
-    parser: Box<dyn Fn(Input) -> Option<(Input, Output)>>,
+    parser: Box<dyn Fn(&Input) -> Option<(&Input, Output)>>,
 
     /// Check that a parser output estimated from the cache is valid
     ///
     /// See constructor docs for semantics.
     ///
-    check_result: Box<dyn Fn(Input, &Output) -> bool>,
+    check_result: Box<dyn Fn(&Input, &Output) -> bool>,
 
     /// Truth that a parse was complex enough to warrant memoization
     ///
     /// Receives as input the input that was parsed and the output that was
     /// produced, returns as output the truth that this is worth caching.
     ///
-    worth_caching: Box<dyn Fn(Input, &Output) -> bool>,
+    worth_caching: Box<dyn Fn(&Input, &Output) -> bool>,
 
     /// Size of a PrefixToOutput list that initiates prefix deduplication
     high_water_mark: usize,
@@ -57,14 +88,14 @@ struct CachingParserConfig<Output> {
     low_water_mark_ratio: f32,
 }
 //
-impl<Output> CachingParserConfig<Output> {
+impl<Input: ByteBased + ?Sized, Output> CachingParserConfig<Input, Output> {
     /// Targeted max PrefixToOutput list length after prefix deduplication
     fn low_water_mark(&self) -> usize {
         (self.low_water_mark_ratio * (self.high_water_mark as f32)) as usize
     }
 }
 //
-impl<Output> CachingParser<Output> {
+impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
     /// Build a caching parser with default configuration
     ///
     /// `parser` is a nom parser that can be expensive to call, which you are
@@ -78,8 +109,8 @@ impl<Output> CachingParser<Output> {
     /// terminators in the residual input.
     ///
     pub fn new(
-        parser: impl Fn(Input) -> Option<(Input, Output)> + 'static,
-        check_result: impl Fn(Input, &Output) -> bool + 'static,
+        parser: impl Fn(&Input) -> Option<(&Input, Output)> + 'static,
+        check_result: impl Fn(&Input, &Output) -> bool + 'static,
     ) -> Self {
         Self::builder(parser, check_result).build()
     }
@@ -89,9 +120,9 @@ impl<Output> CachingParser<Output> {
     /// See `CachingParser::new()` for more info on parameter semantics.
     ///
     pub fn builder(
-        parser: impl Fn(Input) -> Option<(Input, Output)> + 'static,
-        check_result: impl Fn(Input, &Output) -> bool + 'static,
-    ) -> CachingParserBuilder<Output> {
+        parser: impl Fn(&Input) -> Option<(&Input, Output)> + 'static,
+        check_result: impl Fn(&Input, &Output) -> bool + 'static,
+    ) -> CachingParserBuilder<Input, Output> {
         CachingParserBuilder::new(parser, check_result)
     }
 
@@ -100,28 +131,28 @@ impl<Output> CachingParser<Output> {
     // TODO: Just implement the nom Parse trait
     pub fn get_or_insert<'input>(
         &mut self,
-        input: Input<'input>,
-    ) -> Option<(Input<'input>, Rc<Output>)> {
-        Self::get_or_insert_impl(&mut self.data, &mut self.config, input, input.as_ref())
+        input: &'input Input,
+    ) -> Option<(&'input Input, Rc<Output>)> {
+        Self::get_or_insert_impl(&mut self.data, &mut self.config, input, input.as_bytes())
     }
 
     /// Recursive implementation of get_or_insert targeting a cache subtree
     fn get_or_insert_impl<'input>(
         tree: &mut PrefixToOutput<Output>,
-        config: &mut CachingParserConfig<Output>,
-        initial_input: Input<'input>,
-        remaining_input: &'input [u8],
-    ) -> Option<(Input<'input>, Rc<Output>)> {
+        config: &mut CachingParserConfig<Input, Output>,
+        initial_input: &'input Input,
+        remaining_bytes: &'input [u8],
+    ) -> Option<(&'input Input, Rc<Output>)> {
         // Iterate through input prefixes from the current subtree
         for (prefix, mapping) in tree.iter_mut() {
             // If the prefix matches current input...
-            if let Some(remaining_input) = remaining_input.strip_prefix(&**prefix) {
+            if let Some(remaining_bytes) = remaining_bytes.strip_prefix(&**prefix) {
                 match mapping {
                     // ...and if we reached the final output...
                     PrefixMapping::Output(o) => {
                         // ...and if the estimated parser output matches
                         // our expectations (UTF-8 remainder) and the user's...
-                        if let Ok(remaining_input) = std::str::from_utf8(remaining_input) {
+                        if let Some(remaining_input) = Input::try_from(remaining_bytes) {
                             if (config.check_result)(remaining_input, &*o) {
                                 // ...then we're done
                                 return Some((remaining_input, o.clone()));
@@ -136,7 +167,7 @@ impl<Output> CachingParser<Output> {
                             tree,
                             config,
                             initial_input,
-                            remaining_input,
+                            remaining_bytes,
                         );
                     }
                 }
@@ -145,12 +176,12 @@ impl<Output> CachingParser<Output> {
 
         // If no prefix matches, then there is no cached output for this input,
         // and we must run the parser
-        let prefix_len = initial_input.len() - remaining_input.len();
+        let prefix_len = initial_input.len() - remaining_bytes.len();
         let (remaining_input, output) = (config.parser)(initial_input)?;
 
         // Does this parser result feel worth caching?
         let parsed_len = initial_input.len() - remaining_input.len();
-        let parsed_input = &initial_input[..parsed_len];
+        let parsed_input = initial_input.get_prefix(parsed_len).unwrap();
         let output = if (config.worth_caching)(parsed_input, &output) {
             // If so, memoize it
             let new_suffix = parsed_input.as_bytes()[prefix_len..].into();
@@ -180,7 +211,7 @@ impl<Output> CachingParser<Output> {
     ///
     fn deduplicate(
         tree: &mut PrefixToOutput<Output>,
-        config: &mut CachingParserConfig<Output>,
+        config: &mut CachingParserConfig<Input, Output>,
         water_mark_ratio: f32,
     ) {
         // Extract the old subtree and put a new one in its place
@@ -278,15 +309,15 @@ impl<Output> CachingParser<Output> {
 /// Mechanism to configure a CachingParser before building it
 //
 // See method docs for detailed member docs
-pub struct CachingParserBuilder<Output> {
+pub struct CachingParserBuilder<Input: ByteBased + ?Sized, Output> {
     /// Parser to be wrapped
-    parser: Box<dyn Fn(Input) -> Option<(Input, Output)>>,
+    parser: Box<dyn Fn(&Input) -> Option<(&Input, Output)>>,
 
     /// Check that a parser output estimated from the cache is valid
-    check_result: Box<dyn Fn(Input, &Output) -> bool>,
+    check_result: Box<dyn Fn(&Input, &Output) -> bool>,
 
     /// Truth that a parse was complex enough to warrant memoization
-    worth_caching: Option<Box<dyn Fn(Input, &Output) -> bool>>,
+    worth_caching: Option<Box<dyn Fn(&Input, &Output) -> bool>>,
 
     /// Size of a PrefixToOutput list that initiates prefix deduplication
     high_water_mark: usize,
@@ -296,14 +327,14 @@ pub struct CachingParserBuilder<Output> {
     low_water_mark_ratio: f32,
 }
 //
-impl<Output> CachingParserBuilder<Output> {
+impl<Input: ByteBased + ?Sized, Output> CachingParserBuilder<Input, Output> {
     /// Start configuring a CachingParser
     ///
     /// See `CachingParser::new()` for more info on parameter semantics.
     ///
     pub fn new(
-        parser: impl Fn(Input) -> Option<(Input, Output)> + 'static,
-        check_result: impl Fn(Input, &Output) -> bool + 'static,
+        parser: impl Fn(&Input) -> Option<(&Input, Output)> + 'static,
+        check_result: impl Fn(&Input, &Output) -> bool + 'static,
     ) -> Self {
         Self {
             parser: Box::new(parser),
@@ -329,7 +360,7 @@ impl<Output> CachingParserBuilder<Output> {
     ///
     pub fn retention_criterion(
         mut self,
-        worth_caching: impl Fn(Input, &Output) -> bool + 'static,
+        worth_caching: impl Fn(&Input, &Output) -> bool + 'static,
     ) -> Self {
         self.worth_caching = Some(Box::new(worth_caching));
         self
@@ -400,7 +431,7 @@ impl<Output> CachingParserBuilder<Output> {
     }
 
     /// Finish the parser cache building process
-    pub fn build(self) -> CachingParser<Output> {
+    pub fn build(self) -> CachingParser<Input, Output> {
         // Configure the CachingParser
         let worth_caching = self.worth_caching.unwrap_or_else(|| Box::new(|_, _| true));
         let config = CachingParserConfig {
@@ -443,23 +474,23 @@ mod tests {
     fn new() {
         // Basic mocks to test that input functions are used as expected
         static PARSER_CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn parser_mock(_: Input) -> Option<(Input, ())> {
+        fn parser_mock(_: &str) -> Option<(&str, ())> {
             PARSER_CALLS.fetch_add(1, Ordering::Relaxed);
             Some(("", ()))
         }
         static CHECKER_CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn checker_mock(_: Input, _: &()) -> bool {
+        fn checker_mock(_: &str, _: &()) -> bool {
             CHECKER_CALLS.fetch_add(1, Ordering::Relaxed);
             true
         }
         static RETAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn retain_mock(_: Input, _: &()) -> bool {
+        fn retain_mock(_: &str, _: &()) -> bool {
             RETAIN_CALLS.fetch_add(1, Ordering::Relaxed);
             false
         }
 
         // Checks that should be valid no matter how the parser is configured
-        let common_checks = |parser: &CachingParser<_>, expected_retain| {
+        let common_checks = |parser: &CachingParser<_, _>, expected_retain| {
             assert_eq!(parser.data.len(), 0);
             assert_eq!(parser.data.capacity(), parser.config.high_water_mark);
 
@@ -505,7 +536,7 @@ mod tests {
     // string until that space if it finds it, associated check, and a way to
     // monitor how many times the parser and check were called
     fn strip_space_parser_builder() -> (
-        CachingParserBuilder<String>,
+        CachingParserBuilder<str, String>,
         Rc<Cell<usize>>,
         Rc<Cell<usize>>,
     ) {
@@ -514,7 +545,7 @@ mod tests {
         let parse_count2 = parse_count.clone();
         let check_count2 = check_count.clone();
         let builder = CachingParser::builder(
-            move |input| {
+            move |input: &str| {
                 parse_count2.set(parse_count2.get() + 1);
                 input
                     .find(' ')
@@ -531,7 +562,7 @@ mod tests {
         (builder, parse_count, check_count)
     }
     //
-    fn strip_space_parser() -> (CachingParser<String>, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+    fn strip_space_parser() -> (CachingParser<str, String>, Rc<Cell<usize>>, Rc<Cell<usize>>) {
         let (builder, parse_count, check_count) = strip_space_parser_builder();
         (builder.build(), parse_count, check_count)
     }
