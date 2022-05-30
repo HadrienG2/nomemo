@@ -1,6 +1,6 @@
 // TODO: General crate docs + deny(missing_docs)
 
-use nom::AsBytes;
+use nom::{AsBytes, IResult, Parser};
 use std::rc::Rc;
 
 /// We accept as input types which can be infaillibly converted into a sequence
@@ -37,12 +37,12 @@ impl ByteBased for str {
 }
 
 /// Cache of strings we've parsed before and associated parser output
-pub struct CachingParser<Input: ByteBased + ?Sized, Output> {
+pub struct CachingParser<Input: ByteBased + ?Sized, Output, Error> {
     /// Cached (string -> output) mappings
     data: PrefixToOutput<Output>,
 
     /// Cache configuration
-    config: CachingParserConfig<Input, Output>,
+    config: CachingParserConfig<Input, Output, Error>,
 }
 //
 /// Mapping from a chunk of parser input (prefix string) to associated output or
@@ -59,13 +59,12 @@ enum PrefixMapping<Output> {
     Suffixes(PrefixToOutput<Output>),
 }
 //
-struct CachingParserConfig<Input: ByteBased + ?Sized, Output> {
+struct CachingParserConfig<Input: ByteBased + ?Sized, Output, Error> {
     /// Inner parser that we're trying to avoid calling via memoization
     ///
     /// See constructor docs for semantics.
     ///
-    // TODO: Generalize to any nom parser
-    parser: Box<dyn Fn(&Input) -> Option<(&Input, Output)>>,
+    parser: Box<dyn for<'a> Parser<&'a Input, Output, Error>>,
 
     /// Check that a parser output estimated from the cache is valid
     ///
@@ -88,14 +87,22 @@ struct CachingParserConfig<Input: ByteBased + ?Sized, Output> {
     low_water_mark_ratio: f32,
 }
 //
-impl<Input: ByteBased + ?Sized, Output> CachingParserConfig<Input, Output> {
+impl<Input: ByteBased + ?Sized, Output, Error> CachingParserConfig<Input, Output, Error> {
     /// Targeted max PrefixToOutput list length after prefix deduplication
     fn low_water_mark(&self) -> usize {
         (self.low_water_mark_ratio * (self.high_water_mark as f32)) as usize
     }
 }
 //
-impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
+impl<'input, Input: ByteBased + ?Sized, Output, Error> Parser<&'input Input, Rc<Output>, Error>
+    for CachingParser<Input, Output, Error>
+{
+    fn parse(&mut self, input: &'input Input) -> IResult<&'input Input, Rc<Output>, Error> {
+        Self::parse_impl(&mut self.data, &mut self.config, input, input.as_bytes())
+    }
+}
+//
+impl<Input: ByteBased + ?Sized, Output, Error> CachingParser<Input, Output, Error> {
     /// Build a caching parser with default configuration
     ///
     /// `parser` is a nom parser that can be expensive to call, which you are
@@ -108,8 +115,8 @@ impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
     /// terminators, and is typically done by checking for the presence of
     /// terminators in the residual input.
     ///
-    pub fn new(
-        parser: impl Fn(&Input) -> Option<(&Input, Output)> + 'static,
+    pub fn new<RefParser: for<'a> Parser<&'a Input, Output, Error> + 'static>(
+        parser: RefParser,
         check_result: impl Fn(&Input, &Output) -> bool + 'static,
     ) -> Self {
         Self::builder(parser, check_result).build()
@@ -119,30 +126,20 @@ impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
     ///
     /// See `CachingParser::new()` for more info on parameter semantics.
     ///
-    pub fn builder(
-        parser: impl Fn(&Input) -> Option<(&Input, Output)> + 'static,
+    pub fn builder<RefParser: for<'a> Parser<&'a Input, Output, Error> + 'static>(
+        parser: RefParser,
         check_result: impl Fn(&Input, &Output) -> bool + 'static,
-    ) -> CachingParserBuilder<Input, Output> {
+    ) -> CachingParserBuilder<Input, Output, Error> {
         CachingParserBuilder::new(parser, check_result)
     }
 
-    /// Find cached output associated with a string, or compute output and
-    /// insert it into the cache.
-    // TODO: Just implement the nom Parse trait
-    pub fn get_or_insert<'input>(
-        &mut self,
-        input: &'input Input,
-    ) -> Option<(&'input Input, Rc<Output>)> {
-        Self::get_or_insert_impl(&mut self.data, &mut self.config, input, input.as_bytes())
-    }
-
-    /// Recursive implementation of get_or_insert targeting a cache subtree
-    fn get_or_insert_impl<'input>(
+    /// Recursive implementation of parse targeting a cache subtree
+    fn parse_impl<'input>(
         tree: &mut PrefixToOutput<Output>,
-        config: &mut CachingParserConfig<Input, Output>,
+        config: &mut CachingParserConfig<Input, Output, Error>,
         initial_input: &'input Input,
         remaining_bytes: &'input [u8],
-    ) -> Option<(&'input Input, Rc<Output>)> {
+    ) -> IResult<&'input Input, Rc<Output>, Error> {
         // Iterate through input prefixes from the current subtree
         for (prefix, mapping) in tree.iter_mut() {
             // If the prefix matches current input...
@@ -155,7 +152,7 @@ impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
                         if let Some(remaining_input) = Input::try_from(remaining_bytes) {
                             if (config.check_result)(remaining_input, &*o) {
                                 // ...then we're done
-                                return Some((remaining_input, o.clone()));
+                                return Ok((remaining_input, o.clone()));
                             }
                         }
                     }
@@ -163,12 +160,7 @@ impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
                     // If we only ended up on a subtree of suffixes...
                     PrefixMapping::Suffixes(tree) => {
                         // ...then we recurse into that subtree
-                        return Self::get_or_insert_impl(
-                            tree,
-                            config,
-                            initial_input,
-                            remaining_bytes,
-                        );
+                        return Self::parse_impl(tree, config, initial_input, remaining_bytes);
                     }
                 }
             }
@@ -177,7 +169,7 @@ impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
         // If no prefix matches, then there is no cached output for this input,
         // and we must run the parser
         let prefix_len = initial_input.len() - remaining_bytes.len();
-        let (remaining_input, output) = (config.parser)(initial_input)?;
+        let (remaining_input, output) = config.parser.parse(initial_input)?;
 
         // Does this parser result feel worth caching?
         let parsed_len = initial_input.len() - remaining_input.len();
@@ -196,7 +188,7 @@ impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
         } else {
             Rc::new(output)
         };
-        Some((remaining_input, output))
+        Ok((remaining_input, output))
     }
 
     /// Deduplicate a subtree of the cache
@@ -211,7 +203,7 @@ impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
     ///
     fn deduplicate(
         tree: &mut PrefixToOutput<Output>,
-        config: &mut CachingParserConfig<Input, Output>,
+        config: &mut CachingParserConfig<Input, Output, Error>,
         water_mark_ratio: f32,
     ) {
         // Extract the old subtree and put a new one in its place
@@ -309,9 +301,9 @@ impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
 /// Mechanism to configure a CachingParser before building it
 //
 // See method docs for detailed member docs
-pub struct CachingParserBuilder<Input: ByteBased + ?Sized, Output> {
+pub struct CachingParserBuilder<Input: ByteBased + ?Sized, Output, Error> {
     /// Parser to be wrapped
-    parser: Box<dyn Fn(&Input) -> Option<(&Input, Output)>>,
+    parser: Box<dyn for<'a> Parser<&'a Input, Output, Error>>,
 
     /// Check that a parser output estimated from the cache is valid
     check_result: Box<dyn Fn(&Input, &Output) -> bool>,
@@ -327,13 +319,13 @@ pub struct CachingParserBuilder<Input: ByteBased + ?Sized, Output> {
     low_water_mark_ratio: f32,
 }
 //
-impl<Input: ByteBased + ?Sized, Output> CachingParserBuilder<Input, Output> {
+impl<Input: ByteBased + ?Sized, Output, Error> CachingParserBuilder<Input, Output, Error> {
     /// Start configuring a CachingParser
     ///
     /// See `CachingParser::new()` for more info on parameter semantics.
     ///
-    pub fn new(
-        parser: impl Fn(&Input) -> Option<(&Input, Output)> + 'static,
+    pub fn new<RefParser: for<'a> Parser<&'a Input, Output, Error> + 'static>(
+        parser: RefParser,
         check_result: impl Fn(&Input, &Output) -> bool + 'static,
     ) -> Self {
         Self {
@@ -431,7 +423,7 @@ impl<Input: ByteBased + ?Sized, Output> CachingParserBuilder<Input, Output> {
     }
 
     /// Finish the parser cache building process
-    pub fn build(self) -> CachingParser<Input, Output> {
+    pub fn build(self) -> CachingParser<Input, Output, Error> {
         // Configure the CachingParser
         let worth_caching = self.worth_caching.unwrap_or_else(|| Box::new(|_, _| true));
         let config = CachingParserConfig {
@@ -461,7 +453,6 @@ impl<Input: ByteBased + ?Sized, Output> CachingParserBuilder<Input, Output> {
     }
 }
 
-// TODO: Add benchmarks
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,9 +465,9 @@ mod tests {
     fn new() {
         // Basic mocks to test that input functions are used as expected
         static PARSER_CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn parser_mock(_: &str) -> Option<(&str, ())> {
+        fn parser_mock(_: &str) -> IResult<&str, (), ()> {
             PARSER_CALLS.fetch_add(1, Ordering::Relaxed);
-            Some(("", ()))
+            Ok(("", ()))
         }
         static CHECKER_CALLS: AtomicUsize = AtomicUsize::new(0);
         fn checker_mock(_: &str, _: &()) -> bool {
@@ -490,7 +481,7 @@ mod tests {
         }
 
         // Checks that should be valid no matter how the parser is configured
-        let common_checks = |parser: &CachingParser<_, _>, expected_retain| {
+        let common_checks = |parser: &mut CachingParser<_, _, _>, expected_retain| {
             assert_eq!(parser.data.len(), 0);
             assert_eq!(parser.data.capacity(), parser.config.high_water_mark);
 
@@ -499,7 +490,7 @@ mod tests {
             let old_checker_calls = CHECKER_CALLS.load(Ordering::Relaxed);
             let next_checker_calls = old_checker_calls + 1;
 
-            (parser.config.parser)("");
+            parser.config.parser.parse("").unwrap();
             assert_eq!(PARSER_CALLS.load(Ordering::Relaxed), next_parser_calls);
             assert_eq!(CHECKER_CALLS.load(Ordering::Relaxed), old_checker_calls);
 
@@ -513,19 +504,19 @@ mod tests {
         };
 
         // Basic configuration
-        let parser = CachingParser::new(parser_mock, checker_mock);
-        common_checks(&parser, true);
+        let mut parser = CachingParser::new(parser_mock, checker_mock);
+        common_checks(&mut parser, true);
         assert!(parser.config.high_water_mark >= 256);
         assert!(parser.config.low_water_mark() >= 256);
 
         // Custom configuration
-        let parser = CachingParser::builder(parser_mock, checker_mock)
+        let mut parser = CachingParser::builder(parser_mock, checker_mock)
             .retention_criterion(retain_mock)
             .high_water_mark(128)
             .low_water_mark_ratio(0.75)
             .build();
         let old_retain_calls = RETAIN_CALLS.load(Ordering::Relaxed);
-        common_checks(&parser, false);
+        common_checks(&mut parser, false);
         assert_eq!(RETAIN_CALLS.load(Ordering::Relaxed), old_retain_calls + 1);
         assert_eq!(parser.config.high_water_mark, 128);
         assert_eq!(parser.config.low_water_mark_ratio, 0.75);
@@ -535,8 +526,20 @@ mod tests {
     // Basic test parser that looks for a space and strips the beginning of the
     // string until that space if it finds it, associated check, and a way to
     // monitor how many times the parser and check were called
+    fn strip_space_parser_impl(
+        parse_count: Rc<Cell<usize>>,
+    ) -> impl Fn(&str) -> IResult<&str, String, ()> {
+        move |input| {
+            parse_count.set(parse_count.get() + 1);
+            input
+                .find(' ')
+                .map(|pos| (&input[pos..], input[..pos].into()))
+                .ok_or(nom::Err::Failure(()))
+        }
+    }
+    //
     fn strip_space_parser_builder() -> (
-        CachingParserBuilder<str, String>,
+        CachingParserBuilder<str, String, ()>,
         Rc<Cell<usize>>,
         Rc<Cell<usize>>,
     ) {
@@ -545,12 +548,7 @@ mod tests {
         let parse_count2 = parse_count.clone();
         let check_count2 = check_count.clone();
         let builder = CachingParser::builder(
-            move |input: &str| {
-                parse_count2.set(parse_count2.get() + 1);
-                input
-                    .find(' ')
-                    .map(|pos| (&input[pos..], input[..pos].into()))
-            },
+            strip_space_parser_impl(parse_count2),
             move |rest, _output| {
                 check_count2.set(check_count2.get() + 1);
                 match rest.chars().next() {
@@ -562,7 +560,11 @@ mod tests {
         (builder, parse_count, check_count)
     }
     //
-    fn strip_space_parser() -> (CachingParser<str, String>, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+    fn strip_space_parser() -> (
+        CachingParser<str, String, ()>,
+        Rc<Cell<usize>>,
+        Rc<Cell<usize>>,
+    ) {
         let (builder, parse_count, check_count) = strip_space_parser_builder();
         (builder.build(), parse_count, check_count)
     }
@@ -571,10 +573,7 @@ mod tests {
     fn insert_success() {
         let (mut parser, parse_count, check_count) = strip_space_parser();
         let output = Rc::new("And".to_owned());
-        assert_eq!(
-            parser.get_or_insert("And then"),
-            Some((" then", output.clone()))
-        );
+        assert_eq!(parser.parse("And then"), Ok((" then", output.clone())));
         assert_eq!(
             parser.data,
             vec![(
@@ -589,7 +588,7 @@ mod tests {
     #[test]
     fn insert_failure() {
         let (mut parser, parse_count, check_count) = strip_space_parser();
-        assert_eq!(parser.get_or_insert(""), None);
+        assert!(parser.parse("").is_err());
         assert_eq!(parser.data, PrefixToOutput::default());
         assert_eq!(parse_count.get(), 1);
         assert_eq!(check_count.get(), 0);
@@ -598,12 +597,9 @@ mod tests {
     #[test]
     fn retrieve_success() {
         let (mut parser, parse_count, check_count) = strip_space_parser();
-        parser.get_or_insert("And then");
+        parser.parse("And then").unwrap();
         let output = Rc::new("And".to_owned());
-        assert_eq!(
-            parser.get_or_insert("And if"),
-            Some((" if", output.clone()))
-        );
+        assert_eq!(parser.parse("And if"), Ok((" if", output.clone())));
         assert_eq!(
             parser.data,
             vec![(
@@ -618,8 +614,8 @@ mod tests {
     #[test]
     fn retrieve_failure() {
         let (mut parser, parse_count, check_count) = strip_space_parser();
-        parser.get_or_insert("Add to that");
-        assert_eq!(parser.get_or_insert("Additionally"), None);
+        parser.parse("Add to that").unwrap();
+        assert!(parser.parse("Additionally").is_err());
         assert_eq!(
             parser.data,
             vec![(
@@ -638,8 +634,8 @@ mod tests {
             .retention_criterion(|input, _output| input.len() > 128)
             .build();
         assert_eq!(
-            parser.get_or_insert("Something in the way she moves"),
-            Some((" in the way she moves", Rc::new("Something".to_owned())))
+            parser.parse("Something in the way she moves"),
+            Ok((" in the way she moves", Rc::new("Something".to_owned())))
         );
         assert_eq!(parser.data, PrefixToOutput::default());
         assert_eq!(parse_count.get(), 1);
@@ -656,9 +652,9 @@ mod tests {
             .build();
 
         // Until the high water mark is reached, nothing happens
-        parser.get_or_insert("GameObject is a Unity class");
-        parser.get_or_insert("GameOn was a French journal");
-        parser.get_or_insert("GameBoy is a video game console");
+        parser.parse("GameObject is a Unity class").unwrap();
+        parser.parse("GameOn was a French journal").unwrap();
+        parser.parse("GameBoy is a video game console").unwrap();
         let output = |s: &str| Rc::new(s.to_owned());
         let outmap = |s| PrefixMapping::Output(output(s));
         assert_eq!(
@@ -672,7 +668,7 @@ mod tests {
 
         // Once the high water mark is reached, deduplication occurs
         // Because we use the maximal low water mark, it is not recursive here
-        parser.get_or_insert("Not everything is about games");
+        parser.parse("Not everything is about games").unwrap();
         assert_eq!(
             parser.data,
             vec![
@@ -698,14 +694,14 @@ mod tests {
 
         // The cache still works as before with the deduplicated layout
         assert_eq!(
-            parser.get_or_insert("GameObject used to be an adventurer like you"),
-            Some((" used to be an adventurer like you", output("GameObject")))
+            parser.parse("GameObject used to be an adventurer like you"),
+            Ok((" used to be an adventurer like you", output("GameObject")))
         );
         assert_eq!(parse_count.get(), 4);
         assert_eq!(check_count.get(), 1);
         assert_eq!(
-            parser.get_or_insert("GameObjection could exist in Phoenix Wright"),
-            Some((" could exist in Phoenix Wright", output("GameObjection")))
+            parser.parse("GameObjection could exist in Phoenix Wright"),
+            Ok((" could exist in Phoenix Wright", output("GameObjection")))
         );
         assert_eq!(parse_count.get(), 5);
         assert_eq!(check_count.get(), 2);
@@ -724,10 +720,10 @@ mod tests {
 
         // Until we reached 4 items, nothing happens, it's the high water mark
         // that dictates when deduplication occurs.
-        parser.get_or_insert("GameObject is a Unity class");
-        parser.get_or_insert("GameOn was a French journal");
-        parser.get_or_insert("GameBoy is a video game console");
-        parser.get_or_insert("Not everything is about games");
+        parser.parse("GameObject is a Unity class").unwrap();
+        parser.parse("GameOn was a French journal").unwrap();
+        parser.parse("GameBoy is a video game console").unwrap();
+        parser.parse("Not everything is about games").unwrap();
         let output = |s: &str| Rc::new(s.to_owned());
         let outmap = |s| PrefixMapping::Output(output(s));
         assert_eq!(
@@ -742,7 +738,7 @@ mod tests {
 
         // Above the high water mark, the deduplication algorithm gets more
         // aggressive, tying to get down to the individual matches
-        parser.get_or_insert("GameBowl is not a thing (yet?)");
+        parser.parse("GameBowl is not a thing (yet?)").unwrap();
         assert_eq!(
             parser.data,
             vec![
