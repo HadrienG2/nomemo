@@ -1,10 +1,20 @@
-// TODO: General crate docs + deny(missing_docs)
+//! A memoization decorator for nom parsers
+//!
+//! So, you have a nom parser that takes too much time to run, and you have done
+//! anything in your power to speed up its internal logic. Hence it's time to
+//! move to the last line of performance optimization, result memoization.
+//!
+//! This crate provides a `CachingParser` that wraps a nom `Parser` and
+//! maintains a cache of previous (input -> output) parses in order to avoid
+//! calling that parser on inputs for which the output is already known.
+
+#![deny(missing_docs)]
 
 use nom::{AsBytes, IResult, Parser};
 use std::rc::Rc;
 
-/// We accept as input types which can be infaillibly converted into a sequence
-/// of bytes and faillibly converted from some sequences of bytes.
+/// We accept input types which can be infaillibly converted into a sequence of
+/// bytes and faillibly converted from some sequences of bytes.
 pub trait ByteBased: AsBytes {
     /// Try constructing the type from bytes
     fn try_from(bytes: &[u8]) -> Option<&Self>;
@@ -106,7 +116,11 @@ impl<Input: ByteBased + ?Sized, Output, Error> CachingParser<Input, Output, Erro
     /// Build a caching parser with default configuration
     ///
     /// `parser` is a nom parser that can be expensive to call, which you are
-    /// trying to speed up via memoization.
+    /// trying to speed up via memoization. It should obviously be referentially
+    /// transparent (calling it multiple times on the same input should yield
+    /// the same output), otherwise memoization will yield incorrect results. If
+    /// calling it has side effects, memoization will also cause these to occur
+    /// less often that if the parser were called directly.
     ///
     /// `check_result` is a function that can tell if a parser output (input
     /// residual + output) that is estimated from the cache is valid, that is to
