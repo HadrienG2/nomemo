@@ -7,7 +7,7 @@ fn parse(input: &str) -> Option<(&str, ())> {
     input.find(' ').map(|pos| (&input[pos..], ()))
 }
 //
-fn builder() -> CachingParserBuilder {
+fn builder() -> CachingParserBuilder<()> {
     CachingParserBuilder::new(parse, |rest, ()| match rest.chars().next() {
         Some(' ') => true,
         _ => false,

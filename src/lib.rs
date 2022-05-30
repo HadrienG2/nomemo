@@ -4,32 +4,31 @@ use std::rc::Rc;
 
 // TODO: Generalize
 type Input<'a> = &'a str;
-type Output = ();
 
 /// Cache of strings we've parsed before and associated parser output
-pub struct CachingParser {
+pub struct CachingParser<Output> {
     /// Cached (string -> output) mappings
-    data: PrefixToOutput,
+    data: PrefixToOutput<Output>,
 
     /// Cache configuration
-    config: CachingParserConfig,
+    config: CachingParserConfig<Output>,
 }
 //
 /// Mapping from a chunk of parser input (prefix string) to associated output or
 /// possibly next strings (suffixes) eventually leading to parser output.
-type PrefixToOutput = Vec<(Vec<u8>, PrefixMapping)>;
+type PrefixToOutput<Output> = Vec<(Vec<u8>, PrefixMapping<Output>)>;
 //
 /// Things which a prefix string can map into
 #[derive(Clone, Debug, PartialEq)]
-enum PrefixMapping {
+enum PrefixMapping<Output> {
     /// Direct mapping to output data
     Output(Rc<Output>),
 
     /// Indirect mapping via suffixes
-    Suffixes(PrefixToOutput),
+    Suffixes(PrefixToOutput<Output>),
 }
 //
-struct CachingParserConfig {
+struct CachingParserConfig<Output> {
     /// Inner parser that we're trying to avoid calling via memoization
     ///
     /// See constructor docs for semantics.
@@ -58,14 +57,14 @@ struct CachingParserConfig {
     low_water_mark_ratio: f32,
 }
 //
-impl CachingParserConfig {
+impl<Output> CachingParserConfig<Output> {
     /// Targeted max PrefixToOutput list length after prefix deduplication
     fn low_water_mark(&self) -> usize {
         (self.low_water_mark_ratio * (self.high_water_mark as f32)) as usize
     }
 }
 //
-impl CachingParser {
+impl<Output> CachingParser<Output> {
     /// Build a caching parser with default configuration
     ///
     /// `parser` is a nom parser that can be expensive to call, which you are
@@ -92,7 +91,7 @@ impl CachingParser {
     pub fn builder(
         parser: impl Fn(Input) -> Option<(Input, Output)> + 'static,
         check_result: impl Fn(Input, &Output) -> bool + 'static,
-    ) -> CachingParserBuilder {
+    ) -> CachingParserBuilder<Output> {
         CachingParserBuilder::new(parser, check_result)
     }
 
@@ -103,14 +102,183 @@ impl CachingParser {
         &mut self,
         input: Input<'input>,
     ) -> Option<(Input<'input>, Rc<Output>)> {
-        get_or_insert_impl(&mut self.data, &mut self.config, input, input.as_ref())
+        Self::get_or_insert_impl(&mut self.data, &mut self.config, input, input.as_ref())
+    }
+
+    /// Recursive implementation of get_or_insert targeting a cache subtree
+    fn get_or_insert_impl<'input>(
+        tree: &mut PrefixToOutput<Output>,
+        config: &mut CachingParserConfig<Output>,
+        initial_input: Input<'input>,
+        remaining_input: &'input [u8],
+    ) -> Option<(Input<'input>, Rc<Output>)> {
+        // Iterate through input prefixes from the current subtree
+        for (prefix, mapping) in tree.iter_mut() {
+            // If the prefix matches current input...
+            if let Some(remaining_input) = remaining_input.strip_prefix(&**prefix) {
+                match mapping {
+                    // ...and if we reached the final output...
+                    PrefixMapping::Output(o) => {
+                        // ...and if the estimated parser output matches
+                        // our expectations (UTF-8 remainder) and the user's...
+                        if let Ok(remaining_input) = std::str::from_utf8(remaining_input) {
+                            if (config.check_result)(remaining_input, &*o) {
+                                // ...then we're done
+                                return Some((remaining_input, o.clone()));
+                            }
+                        }
+                    }
+
+                    // If we only ended up on a subtree of suffixes...
+                    PrefixMapping::Suffixes(tree) => {
+                        // ...then we recurse into that subtree
+                        return Self::get_or_insert_impl(
+                            tree,
+                            config,
+                            initial_input,
+                            remaining_input,
+                        );
+                    }
+                }
+            }
+        }
+
+        // If no prefix matches, then there is no cached output for this input,
+        // and we must run the parser
+        let prefix_len = initial_input.len() - remaining_input.len();
+        let (remaining_input, output) = (config.parser)(initial_input)?;
+
+        // Does this parser result feel worth caching?
+        let parsed_len = initial_input.len() - remaining_input.len();
+        let parsed_input = &initial_input[..parsed_len];
+        let output = if (config.worth_caching)(parsed_input, &output) {
+            // If so, memoize it
+            let new_suffix = parsed_input.as_bytes()[prefix_len..].into();
+            let output = Rc::new(output);
+            tree.push((new_suffix, PrefixMapping::Output(output.clone())));
+
+            // Deduplcate the current subtree if high water mark is reached
+            if tree.len() >= config.high_water_mark {
+                Self::deduplicate(tree, config, 1.0);
+            }
+            output
+        } else {
+            Rc::new(output)
+        };
+        Some((remaining_input, output))
+    }
+
+    /// Deduplicate a subtree of the cache
+    ///
+    /// Identify sets of entries sharing a common prefix, and turn these entries
+    /// into subtrees indexed by that common prefix where only the divergent
+    /// suffixes remain.
+    ///
+    /// Recursively deduplicate the subtrees created in this manner until they
+    /// are below the low water mark or it is provably impossible for them to go
+    /// below said mark (in which case the water mark is adjusted with a warning)
+    ///
+    fn deduplicate(
+        tree: &mut PrefixToOutput<Output>,
+        config: &mut CachingParserConfig<Output>,
+        water_mark_ratio: f32,
+    ) {
+        // Extract the old subtree and put a new one in its place
+        let mut old_tree = std::mem::take(tree);
+
+        // Prepare to extract entries of the old tree in sorted order
+        old_tree.sort_unstable_by(|(k1, _v1), (k2, _v2)| k1.cmp(k2));
+        let mut old_tree_iter = old_tree.into_iter().peekable();
+
+        // Pick a reference entry and begin deduplication loop
+        let mut reference = old_tree_iter
+            .next()
+            .expect("tree should contain >= 1 element");
+        let mut matches = Vec::new();
+        loop {
+            // Extract all entries that have 1 byte in common with the reference
+            if let Some(&ref_byte) = reference.0.get(0) {
+                while let Some(matching) = old_tree_iter.next_if(|(k, _v)| k[0] == ref_byte) {
+                    matches.push(matching);
+                }
+            }
+
+            // If that search yielded at least one result...
+            if !matches.is_empty() {
+                // ...determine the longest common prefix
+                let prefix = Self::lcp(&reference.0[..], matches.iter().map(|(k, _v)| &k[..]));
+
+                // Set up the associated suffix subtree
+                let prefix = prefix.to_owned();
+                let mut suffixes = std::iter::once(reference)
+                    .chain(matches.drain(..))
+                    .map(|(mut k, v)| {
+                        k.drain(..prefix.len()).for_each(std::mem::drop);
+                        (k, v)
+                    })
+                    .collect::<Vec<_>>();
+
+                // If that subtree is too big, deduplicate it as well
+                if suffixes.len() >= config.low_water_mark() {
+                    Self::deduplicate(&mut suffixes, config, config.low_water_mark_ratio);
+                }
+
+                // Record the deduplicated prefix -> suffixes subtree
+                tree.push((prefix, PrefixMapping::Suffixes(suffixes)));
+            } else {
+                // If no other entry has a prefix in common, keep this one as is
+                tree.push(reference);
+            }
+
+            // Pick the next reference entry or exit the deduplication loop
+            if let Some(new_reference) = old_tree_iter.next() {
+                reference = new_reference;
+            } else {
+                break;
+            }
+        }
+
+        // Check if the appropriate water mark is now satisfied.
+        //
+        // If not, the water mark is unsatisfiable, so increase it with a
+        // warning to 2x above the max observed irreductible subtree length.
+        //
+        if tree.len() >= (config.high_water_mark as f32 * water_mark_ratio) as usize {
+            config.high_water_mark = (2.0 * tree.len() as f32 / water_mark_ratio) as usize;
+            log::warn!(
+                "High water mark is unsatisfiable, increasing it to {}",
+                config.high_water_mark
+            );
+        }
+    }
+
+    /// Determine the longest common prefix of a set of byte slices, knowing
+    /// that their first byte matches
+    fn lcp<'a>(reference: &'a [u8], matches: impl Iterator<Item = &'a [u8]> + Clone) -> &'a [u8] {
+        // Iterate over reference bytes, skipping the first one which we know
+        for (idx, byte) in reference.iter().enumerate().skip(1) {
+            // Check that byte for all slices in the deduplication set
+            for candidate in matches.clone() {
+                match candidate.get(idx) {
+                    // If the byte exists and has the same value, continue
+                    Some(byte2) if byte2 == byte => {}
+
+                    // Otherwise we found the end of the longest common prefix:
+                    // return previous bytes from the reference
+                    _ => return &reference[..idx],
+                }
+            }
+        }
+
+        // If all bytes match, the reference is the longest common prefix
+        reference
     }
 }
 
 /// Mechanism to configure a CachingParser before building it
 //
 // See method docs for detailed member docs
-pub struct CachingParserBuilder {
+pub struct CachingParserBuilder<Output> {
     /// Parser to be wrapped
     parser: Box<dyn Fn(Input) -> Option<(Input, Output)>>,
 
@@ -128,7 +296,7 @@ pub struct CachingParserBuilder {
     low_water_mark_ratio: f32,
 }
 //
-impl CachingParserBuilder {
+impl<Output> CachingParserBuilder<Output> {
     /// Start configuring a CachingParser
     ///
     /// See `CachingParser::new()` for more info on parameter semantics.
@@ -232,7 +400,7 @@ impl CachingParserBuilder {
     }
 
     /// Finish the parser cache building process
-    pub fn build(self) -> CachingParser {
+    pub fn build(self) -> CachingParser<Output> {
         // Configure the CachingParser
         let worth_caching = self.worth_caching.unwrap_or_else(|| Box::new(|_, _| true));
         let config = CachingParserConfig {
@@ -262,166 +430,6 @@ impl CachingParserBuilder {
     }
 }
 
-/// Recursive implementation of get_or_insert targeting a cache subtree
-fn get_or_insert_impl<'input>(
-    tree: &mut PrefixToOutput,
-    config: &mut CachingParserConfig,
-    initial_input: Input<'input>,
-    remaining_input: &'input [u8],
-) -> Option<(Input<'input>, Rc<Output>)> {
-    // Iterate through input prefixes from the current subtree
-    for (prefix, mapping) in tree.iter_mut() {
-        // If the prefix matches current input...
-        if let Some(remaining_input) = remaining_input.strip_prefix(&**prefix) {
-            match mapping {
-                // ...and if we reached the final output...
-                PrefixMapping::Output(o) => {
-                    // ...and if the estimated parser output matches
-                    // our expectations (UTF-8 remainder) and the user's...
-                    if let Ok(remaining_input) = std::str::from_utf8(remaining_input) {
-                        if (config.check_result)(remaining_input, &*o) {
-                            // ...then we're done
-                            return Some((remaining_input, o.clone()));
-                        }
-                    }
-                }
-
-                // If we only ended up on a subtree of suffixes...
-                PrefixMapping::Suffixes(tree) => {
-                    // ...then we recurse into that subtree
-                    return get_or_insert_impl(tree, config, initial_input, remaining_input);
-                }
-            }
-        }
-    }
-
-    // If no prefix matches, then there is no cached output for this input,
-    // and we must run the parser
-    let prefix_len = initial_input.len() - remaining_input.len();
-    let (remaining_input, output) = (config.parser)(initial_input)?;
-
-    // Does this parser result feel worth caching?
-    let parsed_len = initial_input.len() - remaining_input.len();
-    let parsed_input = &initial_input[..parsed_len];
-    let output = if (config.worth_caching)(parsed_input, &output) {
-        // If so, memoize it
-        let new_suffix = parsed_input.as_bytes()[prefix_len..].into();
-        let output = Rc::new(output);
-        tree.push((new_suffix, PrefixMapping::Output(output.clone())));
-
-        // Deduplcate the current subtree if high water mark is reached
-        if tree.len() >= config.high_water_mark {
-            deduplicate(tree, config, 1.0);
-        }
-        output
-    } else {
-        Rc::new(output)
-    };
-    Some((remaining_input, output))
-}
-
-/// Deduplicate a subtree of the cache
-///
-/// Identify sets of entries sharing a common prefix, and turn these entries
-/// into subtrees indexed by that common prefix where only the divergent
-/// suffixes remain.
-///
-/// Recursively deduplicate the subtrees created in this manner until they
-/// are below the low water mark or it is provably impossible for them to go
-/// below said mark (in which case the water mark is adjusted with a warning)
-///
-fn deduplicate(tree: &mut PrefixToOutput, config: &mut CachingParserConfig, water_mark_ratio: f32) {
-    // Extract the old subtree and put a new one in its place
-    let mut old_tree = std::mem::take(tree);
-
-    // Prepare to extract entries of the old tree in sorted order
-    old_tree.sort_unstable_by(|(k1, _v1), (k2, _v2)| k1.cmp(k2));
-    let mut old_tree_iter = old_tree.into_iter().peekable();
-
-    // Pick a reference entry and begin deduplication loop
-    let mut reference = old_tree_iter
-        .next()
-        .expect("tree should contain >= 1 element");
-    let mut matches = Vec::new();
-    loop {
-        // Extract all entries that have 1 byte in common with the reference
-        if let Some(&ref_byte) = reference.0.get(0) {
-            while let Some(matching) = old_tree_iter.next_if(|(k, _v)| k[0] == ref_byte) {
-                matches.push(matching);
-            }
-        }
-
-        // If that search yielded at least one result...
-        if !matches.is_empty() {
-            // ...determine the longest common prefix
-            let prefix = lcp(&reference.0[..], matches.iter().map(|(k, _v)| &k[..]));
-
-            // Set up the associated suffix subtree
-            let prefix = prefix.to_owned();
-            let mut suffixes = std::iter::once(reference)
-                .chain(matches.drain(..))
-                .map(|(mut k, v)| {
-                    k.drain(..prefix.len()).for_each(std::mem::drop);
-                    (k, v)
-                })
-                .collect::<Vec<_>>();
-
-            // If that subtree is too big, deduplicate it as well
-            if suffixes.len() >= config.low_water_mark() {
-                deduplicate(&mut suffixes, config, config.low_water_mark_ratio);
-            }
-
-            // Record the deduplicated prefix -> suffixes subtree
-            tree.push((prefix, PrefixMapping::Suffixes(suffixes)));
-        } else {
-            // If no other entry has a prefix in common, keep this one as is
-            tree.push(reference);
-        }
-
-        // Pick the next reference entry or exit the deduplication loop
-        if let Some(new_reference) = old_tree_iter.next() {
-            reference = new_reference;
-        } else {
-            break;
-        }
-    }
-
-    // Check if the appropriate water mark is now satisfied.
-    //
-    // If not, the water mark is unsatisfiable, so increase it with a
-    // warning to 2x above the max observed irreductible subtree length.
-    //
-    if tree.len() >= (config.high_water_mark as f32 * water_mark_ratio) as usize {
-        config.high_water_mark = (2.0 * tree.len() as f32 / water_mark_ratio) as usize;
-        log::warn!(
-            "High water mark is unsatisfiable, increasing it to {}",
-            config.high_water_mark
-        );
-    }
-}
-
-/// Determine the longest common prefix of a set of byte slices, knowing
-/// that their first byte matches
-fn lcp<'a>(reference: &'a [u8], matches: impl Iterator<Item = &'a [u8]> + Clone) -> &'a [u8] {
-    // Iterate over reference bytes, skipping the first one which we know
-    for (idx, byte) in reference.iter().enumerate().skip(1) {
-        // Check that byte for all slices in the deduplication set
-        for candidate in matches.clone() {
-            match candidate.get(idx) {
-                // If the byte exists and has the same value, continue
-                Some(byte2) if byte2 == byte => {}
-
-                // Otherwise we found the end of the longest common prefix:
-                // return previous bytes from the reference
-                _ => return &reference[..idx],
-            }
-        }
-    }
-
-    // If all bytes match, the reference is the longest common prefix
-    reference
-}
-
 // TODO: Add benchmarks
 #[cfg(test)]
 mod tests {
@@ -435,23 +443,23 @@ mod tests {
     fn new() {
         // Basic mocks to test that input functions are used as expected
         static PARSER_CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn parser_mock(_: Input) -> Option<(Input, Output)> {
+        fn parser_mock(_: Input) -> Option<(Input, ())> {
             PARSER_CALLS.fetch_add(1, Ordering::Relaxed);
-            Some(("", Output::default()))
+            Some(("", ()))
         }
         static CHECKER_CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn checker_mock(_: Input, _: &Output) -> bool {
+        fn checker_mock(_: Input, _: &()) -> bool {
             CHECKER_CALLS.fetch_add(1, Ordering::Relaxed);
             true
         }
         static RETAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn retain_mock(_: Input, _: &Output) -> bool {
+        fn retain_mock(_: Input, _: &()) -> bool {
             RETAIN_CALLS.fetch_add(1, Ordering::Relaxed);
             false
         }
 
         // Checks that should be valid no matter how the parser is configured
-        let common_checks = |parser: &CachingParser, expected_retain| {
+        let common_checks = |parser: &CachingParser<_>, expected_retain| {
             assert_eq!(parser.data.len(), 0);
             assert_eq!(parser.data.capacity(), parser.config.high_water_mark);
 
@@ -464,14 +472,11 @@ mod tests {
             assert_eq!(PARSER_CALLS.load(Ordering::Relaxed), next_parser_calls);
             assert_eq!(CHECKER_CALLS.load(Ordering::Relaxed), old_checker_calls);
 
-            (parser.config.check_result)("", &Output::default());
+            (parser.config.check_result)("", &());
             assert_eq!(PARSER_CALLS.load(Ordering::Relaxed), next_parser_calls);
             assert_eq!(CHECKER_CALLS.load(Ordering::Relaxed), next_checker_calls);
 
-            assert_eq!(
-                (parser.config.worth_caching)("", &Output::default()),
-                expected_retain
-            );
+            assert_eq!((parser.config.worth_caching)("", &()), expected_retain);
             assert_eq!(PARSER_CALLS.load(Ordering::Relaxed), next_parser_calls);
             assert_eq!(CHECKER_CALLS.load(Ordering::Relaxed), next_checker_calls);
         };
@@ -499,7 +504,11 @@ mod tests {
     // Basic test parser that looks for a space and strips the beginning of the
     // string until that space if it finds it, associated check, and a way to
     // monitor how many times the parser and check were called
-    fn strip_space_parser_builder() -> (CachingParserBuilder, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+    fn strip_space_parser_builder() -> (
+        CachingParserBuilder<String>,
+        Rc<Cell<usize>>,
+        Rc<Cell<usize>>,
+    ) {
         let parse_count = Rc::new(Cell::new(0));
         let check_count = Rc::new(Cell::new(0));
         let parse_count2 = parse_count.clone();
@@ -509,11 +518,10 @@ mod tests {
                 parse_count2.set(parse_count2.get() + 1);
                 input
                     .find(' ')
-                    .map(|pos| (&input[pos..], Output::default()))
+                    .map(|pos| (&input[pos..], input[..pos].into()))
             },
-            move |rest, output| {
+            move |rest, _output| {
                 check_count2.set(check_count2.get() + 1);
-                assert_eq!(output, &Output::default());
                 match rest.chars().next() {
                     Some(' ') => true,
                     _ => false,
@@ -523,7 +531,7 @@ mod tests {
         (builder, parse_count, check_count)
     }
     //
-    fn strip_space_parser() -> (CachingParser, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+    fn strip_space_parser() -> (CachingParser<String>, Rc<Cell<usize>>, Rc<Cell<usize>>) {
         let (builder, parse_count, check_count) = strip_space_parser_builder();
         (builder.build(), parse_count, check_count)
     }
@@ -531,7 +539,7 @@ mod tests {
     #[test]
     fn insert_success() {
         let (mut parser, parse_count, check_count) = strip_space_parser();
-        let output = Rc::new(Output::default());
+        let output = Rc::new("And".to_owned());
         assert_eq!(
             parser.get_or_insert("And then"),
             Some((" then", output.clone()))
@@ -560,7 +568,7 @@ mod tests {
     fn retrieve_success() {
         let (mut parser, parse_count, check_count) = strip_space_parser();
         parser.get_or_insert("And then");
-        let output = Rc::new(Output::default());
+        let output = Rc::new("And".to_owned());
         assert_eq!(
             parser.get_or_insert("And if"),
             Some((" if", output.clone()))
@@ -585,7 +593,7 @@ mod tests {
             parser.data,
             vec![(
                 "Add".as_bytes().into(),
-                PrefixMapping::Output(Rc::new(Output::default()))
+                PrefixMapping::Output(Rc::new("Add".to_owned()))
             )]
         );
         assert_eq!(parse_count.get(), 2);
@@ -598,10 +606,9 @@ mod tests {
         let mut parser = parser_builder
             .retention_criterion(|input, _output| input.len() > 128)
             .build();
-        let output = Rc::new(Output::default());
         assert_eq!(
             parser.get_or_insert("Something in the way she moves"),
-            Some((" in the way she moves", output.clone()))
+            Some((" in the way she moves", Rc::new("Something".to_owned())))
         );
         assert_eq!(parser.data, PrefixToOutput::default());
         assert_eq!(parse_count.get(), 1);
@@ -621,14 +628,14 @@ mod tests {
         parser.get_or_insert("GameObject is a Unity class");
         parser.get_or_insert("GameOn was a French journal");
         parser.get_or_insert("GameBoy is a video game console");
-        let output = Rc::new(Output::default());
-        let outmap = PrefixMapping::Output(output.clone());
+        let output = |s: &str| Rc::new(s.to_owned());
+        let outmap = |s| PrefixMapping::Output(output(s));
         assert_eq!(
             parser.data,
             vec![
-                ("GameObject".as_bytes().into(), outmap.clone()),
-                ("GameOn".as_bytes().into(), outmap.clone()),
-                ("GameBoy".as_bytes().into(), outmap.clone()),
+                ("GameObject".as_bytes().into(), outmap("GameObject")),
+                ("GameOn".as_bytes().into(), outmap("GameOn")),
+                ("GameBoy".as_bytes().into(), outmap("GameBoy")),
             ]
         );
 
@@ -641,13 +648,13 @@ mod tests {
                 (
                     "Game".as_bytes().into(),
                     PrefixMapping::Suffixes(vec![
-                        ("Boy".as_bytes().into(), outmap.clone()),
+                        ("Boy".as_bytes().into(), outmap("GameBoy")),
                         // Notice the remaining "O" duplication here
-                        ("Object".as_bytes().into(), outmap.clone()),
-                        ("On".as_bytes().into(), outmap.clone()),
+                        ("Object".as_bytes().into(), outmap("GameObject")),
+                        ("On".as_bytes().into(), outmap("GameOn")),
                     ])
                 ),
-                ("Not".as_bytes().into(), outmap.clone()),
+                ("Not".as_bytes().into(), outmap("Not")),
             ]
         );
 
@@ -661,13 +668,13 @@ mod tests {
         // The cache still works as before with the deduplicated layout
         assert_eq!(
             parser.get_or_insert("GameObject used to be an adventurer like you"),
-            Some((" used to be an adventurer like you", output.clone()))
+            Some((" used to be an adventurer like you", output("GameObject")))
         );
         assert_eq!(parse_count.get(), 4);
         assert_eq!(check_count.get(), 1);
         assert_eq!(
             parser.get_or_insert("GameObjection could exist in Phoenix Wright"),
-            Some((" could exist in Phoenix Wright", output.clone()))
+            Some((" could exist in Phoenix Wright", output("GameObjection")))
         );
         assert_eq!(parse_count.get(), 5);
         assert_eq!(check_count.get(), 2);
@@ -690,15 +697,15 @@ mod tests {
         parser.get_or_insert("GameOn was a French journal");
         parser.get_or_insert("GameBoy is a video game console");
         parser.get_or_insert("Not everything is about games");
-        let output = Rc::new(Output::default());
-        let outmap = PrefixMapping::Output(output.clone());
+        let output = |s: &str| Rc::new(s.to_owned());
+        let outmap = |s| PrefixMapping::Output(output(s));
         assert_eq!(
             parser.data,
             vec![
-                ("GameObject".as_bytes().into(), outmap.clone()),
-                ("GameOn".as_bytes().into(), outmap.clone()),
-                ("GameBoy".as_bytes().into(), outmap.clone()),
-                ("Not".as_bytes().into(), outmap.clone()),
+                ("GameObject".as_bytes().into(), outmap("GameObject")),
+                ("GameOn".as_bytes().into(), outmap("GameOn")),
+                ("GameBoy".as_bytes().into(), outmap("GameBoy")),
+                ("Not".as_bytes().into(), outmap("Not")),
             ]
         );
 
@@ -714,20 +721,20 @@ mod tests {
                         (
                             "Bo".as_bytes().into(),
                             PrefixMapping::Suffixes(vec![
-                                ("wl".as_bytes().into(), outmap.clone()),
-                                ("y".as_bytes().into(), outmap.clone()),
+                                ("wl".as_bytes().into(), outmap("GameBowl")),
+                                ("y".as_bytes().into(), outmap("GameBoy")),
                             ])
                         ),
                         (
                             "O".as_bytes().into(),
                             PrefixMapping::Suffixes(vec![
-                                ("bject".as_bytes().into(), outmap.clone()),
-                                ("n".as_bytes().into(), outmap.clone()),
+                                ("bject".as_bytes().into(), outmap("GameObject")),
+                                ("n".as_bytes().into(), outmap("GameOn")),
                             ])
                         ),
                     ])
                 ),
-                ("Not".as_bytes().into(), outmap.clone()),
+                ("Not".as_bytes().into(), outmap("Not")),
             ]
         );
         assert_eq!(parse_count.get(), 5);
