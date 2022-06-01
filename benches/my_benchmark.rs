@@ -1,13 +1,19 @@
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
+use nom::{IResult, Parser};
 use nomemo::CachingParserBuilder;
 
-fn parse(input: &str) -> Option<(&str, ())> {
-    input.find(' ').map(|pos| (&input[pos..], ()))
+fn parse(input: &str) -> IResult<&str, (), ()> {
+    use nom::{
+        character::complete::satisfy,
+        combinator::{recognize, value},
+        multi::many0_count,
+    };
+    value((), recognize(many0_count(satisfy(|c| c != ' ')))).parse(input)
 }
 //
-fn builder() -> CachingParserBuilder<()> {
+fn builder() -> CachingParserBuilder<str, (), ()> {
     CachingParserBuilder::new(parse, |rest, ()| match rest.chars().next() {
         Some(' ') => true,
         _ => false,
@@ -25,21 +31,21 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("insert/pass/discard", |b| {
         b.iter_batched_ref(
             || builder().retention_criterion(|_, _| false).build(),
-            |parser| parser.get_or_insert(black_box("A thing")),
+            |parser| parser.parse(black_box("A thing")),
             BatchSize::LargeInput,
         )
     });
     c.bench_function("insert/pass/cache", |b| {
         b.iter_batched_ref(
             || builder().build(),
-            |parser| parser.get_or_insert(black_box("A thing")),
+            |parser| parser.parse(black_box("A thing")),
             BatchSize::LargeInput,
         )
     });
     c.bench_function("insert/fail", |b| {
         b.iter_batched_ref(
             || builder().build(),
-            |parser| parser.get_or_insert(black_box("A")),
+            |parser| parser.parse(black_box("A")),
             BatchSize::LargeInput,
         )
     });
@@ -52,27 +58,27 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let mut parser = builder()
             .retention_criterion(|input, _| input == "A")
             .build();
-        parser.get_or_insert("A thing");
+        parser.parse("A thing");
         parser
     };
     c.bench_function("retrieve/pass", |b| {
         b.iter_batched_ref(
             setup,
-            |parser| parser.get_or_insert(black_box("A similar thing")),
+            |parser| parser.parse(black_box("A similar thing")),
             BatchSize::LargeInput,
         )
     });
     c.bench_function("retrieve/fail/prefix", |b| {
         b.iter_batched_ref(
             setup,
-            |parser| parser.get_or_insert(black_box("B sides...")),
+            |parser| parser.parse(black_box("B sides...")),
             BatchSize::LargeInput,
         )
     });
     c.bench_function("retrieve/fail/check", |b| {
         b.iter_batched_ref(
             setup,
-            |parser| parser.get_or_insert(black_box("An other thing")),
+            |parser| parser.parse(black_box("An other thing")),
             BatchSize::LargeInput,
         )
     });
@@ -110,7 +116,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             for input in 0..num_items {
                 write_digits(&mut buf, input, num_digits, 64);
                 buf.push(' ');
-                parser.get_or_insert(&buf);
+                parser.parse(&buf);
                 buf.clear();
             }
             parser
@@ -124,7 +130,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                 |b, _| {
                     b.iter_batched_ref(
                         || setup(num_inputs),
-                        |parser| parser.get_or_insert(black_box("##")),
+                        |parser| parser.parse(black_box("##")),
                         BatchSize::LargeInput,
                     )
                 },
@@ -154,7 +160,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             let mut buf = Vec::<u8>::with_capacity(tree_depth + 1);
             buf.push(b' ');
             for _ in 0..tree_depth {
-                parser.get_or_insert(std::str::from_utf8(&buf).unwrap());
+                parser.parse(std::str::from_utf8(&buf).unwrap());
                 buf.insert(buf.len() - 1, b'A');
             }
             parser
@@ -169,7 +175,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                 |b, _| {
                     b.iter_batched_ref(
                         || setup(tree_depth),
-                        |parser| parser.get_or_insert(black_box(&input)),
+                        |parser| parser.parse(black_box(&input)),
                         BatchSize::LargeInput,
                     )
                 },
@@ -207,7 +213,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             for input in 0..NUM_ITEMS {
                 write_digits(&mut buf, input, num_digits, arity);
                 buf.push(' ');
-                parser.get_or_insert(&buf);
+                parser.parse(&buf);
                 buf.clear();
             }
             parser
@@ -227,7 +233,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::from_parameter(arity as u64), &arity, |b, _| {
                 b.iter_batched_ref(
                     || setup(arity),
-                    |parser| parser.get_or_insert(black_box(&input)),
+                    |parser| parser.parse(black_box(&input)),
                     BatchSize::LargeInput,
                 )
             });
@@ -254,7 +260,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     }
                     write_digits(&mut buf, suffix, 1, 64);
                     buf.push(' ');
-                    parser.get_or_insert(&buf);
+                    parser.parse(&buf);
                     buf.pop();
                     buf.pop();
                 }
@@ -277,7 +283,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     |b| {
                         b.iter_batched_ref(
                             || setup(num_prefixes, num_suffixes),
-                            |parser| parser.get_or_insert(black_box(&input)),
+                            |parser| parser.parse(black_box(&input)),
                             BatchSize::LargeInput,
                         )
                     },
