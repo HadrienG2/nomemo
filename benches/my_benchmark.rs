@@ -4,7 +4,7 @@ use criterion::{
 use nom::{IResult, Parser};
 use nomemo::CachingParserBuilder;
 
-fn parse(input: &str) -> IResult<&str, (), ()> {
+fn parse(input: &str) -> IResult<&str, ()> {
     use nom::{
         character::complete::satisfy,
         combinator::{recognize, value},
@@ -13,7 +13,7 @@ fn parse(input: &str) -> IResult<&str, (), ()> {
     value((), recognize(many0_count(satisfy(|c| c != ' ')))).parse(input)
 }
 //
-fn builder() -> CachingParserBuilder<str, (), ()> {
+fn builder() -> CachingParserBuilder<str, ()> {
     CachingParserBuilder::new(parse, |rest, ()| match rest.chars().next() {
         Some(' ') => true,
         _ => false,
@@ -58,7 +58,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let mut parser = builder()
             .retention_criterion(|input, _| input == "A")
             .build();
-        parser.parse("A thing");
+        parser.parse("A thing").unwrap();
         parser
     };
     c.bench_function("retrieve/pass", |b| {
@@ -116,7 +116,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             for input in 0..num_items {
                 write_digits(&mut buf, input, num_digits, 64);
                 buf.push(' ');
-                parser.parse(&buf);
+                parser.parse(&buf).unwrap();
                 buf.clear();
             }
             parser
@@ -160,7 +160,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             let mut buf = Vec::<u8>::with_capacity(tree_depth + 1);
             buf.push(b' ');
             for _ in 0..tree_depth {
-                parser.parse(std::str::from_utf8(&buf).unwrap());
+                parser.parse(std::str::from_utf8(&buf).unwrap()).unwrap();
                 buf.insert(buf.len() - 1, b'A');
             }
             parser
@@ -213,7 +213,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             for input in 0..NUM_ITEMS {
                 write_digits(&mut buf, input, num_digits, arity);
                 buf.push(' ');
-                parser.parse(&buf);
+                parser.parse(&buf).unwrap();
                 buf.clear();
             }
             parser
@@ -260,7 +260,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     }
                     write_digits(&mut buf, suffix, 1, 64);
                     buf.push(' ');
-                    parser.parse(&buf);
+                    parser.parse(&buf).unwrap();
                     buf.pop();
                     buf.pop();
                 }

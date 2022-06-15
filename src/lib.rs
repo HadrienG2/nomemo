@@ -10,7 +10,7 @@
 
 #![deny(missing_docs)]
 
-use nom::{AsBytes, IResult, Parser};
+use nom::{error::Error, AsBytes, IResult, Parser};
 use std::rc::Rc;
 
 /// We accept input types which can be infaillibly converted into a sequence of
@@ -47,12 +47,16 @@ impl ByteBased for str {
 }
 
 /// Cache of strings we've parsed before and associated parser output
-pub struct CachingParser<Input: ByteBased + ?Sized, Output, Error> {
+//
+// FIXME: Cannot be generic over Error in current Rust, as far as I can tell
+//        this requires higher-kinded types or maybe generic associated types.
+//
+pub struct CachingParser<Input: ByteBased + ?Sized, Output> {
     /// Cached (string -> output) mappings
     data: PrefixToOutput<Output>,
 
     /// Cache configuration
-    config: CachingParserConfig<Input, Output, Error>,
+    config: CachingParserConfig<Input, Output>,
 }
 //
 /// Mapping from a chunk of parser input (prefix string) to associated output or
@@ -69,12 +73,12 @@ enum PrefixMapping<Output> {
     Suffixes(PrefixToOutput<Output>),
 }
 //
-struct CachingParserConfig<Input: ByteBased + ?Sized, Output, Error> {
+struct CachingParserConfig<Input: ByteBased + ?Sized, Output> {
     /// Inner parser that we're trying to avoid calling via memoization
     ///
     /// See constructor docs for semantics.
     ///
-    parser: Box<dyn for<'a> Parser<&'a Input, Output, Error>>,
+    parser: Box<dyn for<'a> Parser<&'a Input, Output, Error<&'a Input>>>,
 
     /// Check that a parser output estimated from the cache is valid
     ///
@@ -97,22 +101,22 @@ struct CachingParserConfig<Input: ByteBased + ?Sized, Output, Error> {
     low_water_mark_ratio: f32,
 }
 //
-impl<Input: ByteBased + ?Sized, Output, Error> CachingParserConfig<Input, Output, Error> {
+impl<Input: ByteBased + ?Sized, Output> CachingParserConfig<Input, Output> {
     /// Targeted max PrefixToOutput list length after prefix deduplication
     fn low_water_mark(&self) -> usize {
         (self.low_water_mark_ratio * (self.high_water_mark as f32)) as usize
     }
 }
 //
-impl<'input, Input: ByteBased + ?Sized, Output, Error> Parser<&'input Input, Rc<Output>, Error>
-    for CachingParser<Input, Output, Error>
+impl<'input, Input: ByteBased + ?Sized, Output>
+    Parser<&'input Input, Rc<Output>, Error<&'input Input>> for CachingParser<Input, Output>
 {
-    fn parse(&mut self, input: &'input Input) -> IResult<&'input Input, Rc<Output>, Error> {
+    fn parse(&mut self, input: &'input Input) -> IResult<&'input Input, Rc<Output>> {
         Self::parse_impl(&mut self.data, &mut self.config, input, input.as_bytes())
     }
 }
 //
-impl<Input: ByteBased + ?Sized, Output, Error> CachingParser<Input, Output, Error> {
+impl<Input: ByteBased + ?Sized, Output> CachingParser<Input, Output> {
     /// Build a caching parser with default configuration
     ///
     /// `parser` is a nom parser that can be expensive to call, which you are
@@ -129,7 +133,7 @@ impl<Input: ByteBased + ?Sized, Output, Error> CachingParser<Input, Output, Erro
     /// terminators, and is typically done by checking for the presence of
     /// terminators in the residual input.
     ///
-    pub fn new<RefParser: for<'a> Parser<&'a Input, Output, Error> + 'static>(
+    pub fn new<RefParser: for<'a> Parser<&'a Input, Output, Error<&'a Input>> + 'static>(
         parser: RefParser,
         check_result: impl Fn(&Input, &Output) -> bool + 'static,
     ) -> Self {
@@ -140,20 +144,20 @@ impl<Input: ByteBased + ?Sized, Output, Error> CachingParser<Input, Output, Erro
     ///
     /// See `CachingParser::new()` for more info on parameter semantics.
     ///
-    pub fn builder<RefParser: for<'a> Parser<&'a Input, Output, Error> + 'static>(
+    pub fn builder<RefParser: for<'a> Parser<&'a Input, Output, Error<&'a Input>> + 'static>(
         parser: RefParser,
         check_result: impl Fn(&Input, &Output) -> bool + 'static,
-    ) -> CachingParserBuilder<Input, Output, Error> {
+    ) -> CachingParserBuilder<Input, Output> {
         CachingParserBuilder::new(parser, check_result)
     }
 
     /// Recursive implementation of parse targeting a cache subtree
     fn parse_impl<'input>(
         tree: &mut PrefixToOutput<Output>,
-        config: &mut CachingParserConfig<Input, Output, Error>,
+        config: &mut CachingParserConfig<Input, Output>,
         initial_input: &'input Input,
         remaining_bytes: &'input [u8],
-    ) -> IResult<&'input Input, Rc<Output>, Error> {
+    ) -> IResult<&'input Input, Rc<Output>> {
         // Iterate through input prefixes from the current subtree
         for (prefix, mapping) in tree.iter_mut() {
             // If the prefix matches current input...
@@ -217,7 +221,7 @@ impl<Input: ByteBased + ?Sized, Output, Error> CachingParser<Input, Output, Erro
     ///
     fn deduplicate(
         tree: &mut PrefixToOutput<Output>,
-        config: &mut CachingParserConfig<Input, Output, Error>,
+        config: &mut CachingParserConfig<Input, Output>,
         water_mark_ratio: f32,
     ) {
         // Extract the old subtree and put a new one in its place
@@ -315,9 +319,9 @@ impl<Input: ByteBased + ?Sized, Output, Error> CachingParser<Input, Output, Erro
 /// Mechanism to configure a CachingParser before building it
 //
 // See method docs for detailed member docs
-pub struct CachingParserBuilder<Input: ByteBased + ?Sized, Output, Error> {
+pub struct CachingParserBuilder<Input: ByteBased + ?Sized, Output> {
     /// Parser to be wrapped
-    parser: Box<dyn for<'a> Parser<&'a Input, Output, Error>>,
+    parser: Box<dyn for<'a> Parser<&'a Input, Output, Error<&'a Input>>>,
 
     /// Check that a parser output estimated from the cache is valid
     check_result: Box<dyn Fn(&Input, &Output) -> bool>,
@@ -333,12 +337,12 @@ pub struct CachingParserBuilder<Input: ByteBased + ?Sized, Output, Error> {
     low_water_mark_ratio: f32,
 }
 //
-impl<Input: ByteBased + ?Sized, Output, Error> CachingParserBuilder<Input, Output, Error> {
+impl<Input: ByteBased + ?Sized, Output> CachingParserBuilder<Input, Output> {
     /// Start configuring a CachingParser
     ///
     /// See `CachingParser::new()` for more info on parameter semantics.
     ///
-    pub fn new<RefParser: for<'a> Parser<&'a Input, Output, Error> + 'static>(
+    pub fn new<RefParser: for<'a> Parser<&'a Input, Output, Error<&'a Input>> + 'static>(
         parser: RefParser,
         check_result: impl Fn(&Input, &Output) -> bool + 'static,
     ) -> Self {
@@ -437,7 +441,7 @@ impl<Input: ByteBased + ?Sized, Output, Error> CachingParserBuilder<Input, Outpu
     }
 
     /// Finish the parser cache building process
-    pub fn build(self) -> CachingParser<Input, Output, Error> {
+    pub fn build(self) -> CachingParser<Input, Output> {
         // Configure the CachingParser
         let worth_caching = self.worth_caching.unwrap_or_else(|| Box::new(|_, _| true));
         let config = CachingParserConfig {
@@ -479,7 +483,7 @@ mod tests {
     fn new() {
         // Basic mocks to test that input functions are used as expected
         static PARSER_CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn parser_mock(_: &str) -> IResult<&str, (), ()> {
+        fn parser_mock(_: &str) -> IResult<&str, ()> {
             PARSER_CALLS.fetch_add(1, Ordering::Relaxed);
             Ok(("", ()))
         }
@@ -495,7 +499,7 @@ mod tests {
         }
 
         // Checks that should be valid no matter how the parser is configured
-        let common_checks = |parser: &mut CachingParser<_, _, _>, expected_retain| {
+        let common_checks = |parser: &mut CachingParser<_, _>, expected_retain| {
             assert_eq!(parser.data.len(), 0);
             assert_eq!(parser.data.capacity(), parser.config.high_water_mark);
 
@@ -542,18 +546,21 @@ mod tests {
     // monitor how many times the parser and check were called
     fn strip_space_parser_impl(
         parse_count: Rc<Cell<usize>>,
-    ) -> impl Fn(&str) -> IResult<&str, String, ()> {
+    ) -> impl Fn(&str) -> IResult<&str, String> {
         move |input| {
             parse_count.set(parse_count.get() + 1);
             input
                 .find(' ')
                 .map(|pos| (&input[pos..], input[..pos].into()))
-                .ok_or(nom::Err::Failure(()))
+                .ok_or(nom::Err::Failure(Error::new(
+                    input,
+                    nom::error::ErrorKind::Space,
+                )))
         }
     }
     //
     fn strip_space_parser_builder() -> (
-        CachingParserBuilder<str, String, ()>,
+        CachingParserBuilder<str, String>,
         Rc<Cell<usize>>,
         Rc<Cell<usize>>,
     ) {
@@ -574,11 +581,7 @@ mod tests {
         (builder, parse_count, check_count)
     }
     //
-    fn strip_space_parser() -> (
-        CachingParser<str, String, ()>,
-        Rc<Cell<usize>>,
-        Rc<Cell<usize>>,
-    ) {
+    fn strip_space_parser() -> (CachingParser<str, String>, Rc<Cell<usize>>, Rc<Cell<usize>>) {
         let (builder, parse_count, check_count) = strip_space_parser_builder();
         (builder.build(), parse_count, check_count)
     }
